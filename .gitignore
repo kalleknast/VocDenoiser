@@ -1,0 +1,20 @@
+# Personal Claude Code guidance — keep private
+CLAUDE.local.md
+.claude/settings.local.json
+
+# Data (large audio; keep out of version control)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.ipynb_checkpoints/
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+artifacts/
+reports/*.csv

@@ -1,0 +1,172 @@
+"""Central configuration for the β-VAE denoiser.
+
+Every tunable knob (data root, STFT/mel geometry, model width, optimiser, and
+the colony-noise recipe constants from ``SPECS.md``) lives here so nothing is
+scattered as a literal across the codebase. ``train.py`` / ``eval.py`` build a
+:class:`Config` from CLI flags with an env-var fallback for the data root, which
+keeps the pipeline environment-agnostic (Colab Drive *or* a local box) — no path
+is ever hardcoded.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+
+# Downsampling factor of the 4-layer, stride-2 encoder (2**4). The spectrogram's
+# mel and frame dimensions must be divisible by this so the symmetric decoder
+# reconstructs the exact input shape without interpolation.
+DOWNSAMPLE = 16
+
+DATA_ROOT_ENV = "VOCDENOISER_DATA_ROOT"
+# In-repo clean phee-call set (50k isolated calls). Used as the final fallback
+# when neither --data-root nor $VOCDENOISER_DATA_ROOT is given. Relative to CWD,
+# so it stays portable across Colab / local box.
+DEFAULT_DATA_ROOT = "data/Vocalizations"
+
+
+@dataclass
+class Config:
+    """All hyperparameters for data synthesis, model, and training."""
+
+    # --- Data -------------------------------------------------------------
+    # Root holding the *clean* isolated phee-call WAVs (the off-repo training
+    # set — see CLAUDE.local.md). NOT data/Noise/, which is colony noise only.
+    data_root: str | None = None
+    # Real colony-noise WAVs for optional real-noise augmentation. The synthetic
+    # recipe (augment.py) is the primary source; this is here for future mixing.
+    noise_root: str = "data/Noise"
+    # Glob used to discover clean calls under ``data_root`` (recursive).
+    clean_glob: str = "**/*.wav"
+
+    # --- Audio / spectrogram ---------------------------------------------
+    sr: int = 96_000  # source rate (96 kHz mono 16-bit PCM per SPECS)
+    resample_sr: int | None = None  # if set, resample to this rate before STFT
+    n_fft: int = 1024
+    hop: int = 512
+    n_mels: int = 128
+    n_frames: int = 256  # fixed time dimension (crop/pad); ~1.4 s at 96 kHz/hop 512
+    f_min: float = 50.0
+    f_max: float | None = None  # None -> effective_sr / 2
+    # Log-mel dB normalisation window: (db - db_min) / (db_ref - db_min), clamped.
+    db_ref: float = 0.0
+    db_min: float = -80.0
+
+    # --- Model ------------------------------------------------------------
+    latent_dim: int = 16  # scientifically validated for marmoset similarity (SPECS)
+    base_channels: int = 32  # encoder ch = [32, 64, 128, 256]
+    beta: float = 4.0  # KL weight in L = MSE + beta * D_KL
+
+    # --- Optimisation -----------------------------------------------------
+    batch_size: int = 32
+    lr: float = 1e-3
+    max_epochs: int = 100
+    num_workers: int = 4
+    val_frac: float = 0.1
+    ckpt_dir: str = "checkpoints"
+    seed: int = 42
+
+    # --- Colony-noise recipe (SPECS.md / noise-recipe skill) --------------
+    # Composite noise-bed mixing weights: 40% pink, 50% babble, 10% transients.
+    weight_pink: float = 0.40
+    weight_babble: float = 0.50
+    weight_transient: float = 0.10
+    snr_db_min: float = -5.0  # dynamic SNR sampled uniformly in [-5, +15] dB
+    snr_db_max: float = 15.0
+    max_offset_ms: float = 500.0  # temporal offsets 0–500 ms between sources
+    babble_min_calls: int = 5  # babble mixes 5–10 attenuated shifted calls
+    babble_max_calls: int = 10
+    babble_atten_db: tuple[float, float] = (-20.0, -6.0)  # per-call attenuation range
+    transient_ms_min: float = 5.0  # white-noise bursts 5–20 ms
+    transient_ms_max: float = 20.0
+    n_transients: tuple[int, int] = (2, 6)  # bursts per clip
+    # Bioacoustic perturbations applied to the call (shared by input & target so
+    # they stay time-aligned — noise is only added to the input).
+    pitch_pct: float = 5.0  # pitch shift ±5%
+    stretch_pct: float = 10.0  # time stretch ±10%
+    augment: bool = True  # master switch for noise + perturbations (off for eval)
+
+    _extras: dict = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.n_mels % DOWNSAMPLE or self.n_frames % DOWNSAMPLE:
+            raise ValueError(
+                f"n_mels ({self.n_mels}) and n_frames ({self.n_frames}) must be "
+                f"divisible by {DOWNSAMPLE} for the symmetric encoder/decoder."
+            )
+
+    # --- Derived quantities ----------------------------------------------
+    @property
+    def effective_sr(self) -> int:
+        """Sample rate the STFT actually sees (after optional resampling)."""
+        return self.resample_sr or self.sr
+
+    @property
+    def effective_f_max(self) -> float:
+        return self.f_max if self.f_max is not None else self.effective_sr / 2
+
+    @property
+    def waveform_len(self) -> int:
+        """Waveform length (samples) that yields exactly ``n_frames`` mel frames.
+
+        torchaudio's MelSpectrogram uses ``center=True`` (reflection pad of
+        ``n_fft//2`` each side), so ``frames ≈ 1 + len // hop``.
+        """
+        return (self.n_frames - 1) * self.hop
+
+    @property
+    def spec_shape(self) -> tuple[int, int, int]:
+        """(channels, mels, frames) of a single spectrogram sample."""
+        return (1, self.n_mels, self.n_frames)
+
+    def resolved_data_root(self) -> Path:
+        """Clean-call root, resolved as --data-root > $VOCDENOISER_DATA_ROOT > default.
+
+        Points at the isolated phee-call WAVs (``data/Vocalizations`` by default),
+        NOT ``data/Noise`` — that folder is colony noise for augmentation only. For
+        training speed, copy the calls to local disk first rather than reading off
+        the pCloud FUSE mount.
+        """
+        root = self.data_root or os.environ.get(DATA_ROOT_ENV) or DEFAULT_DATA_ROOT
+        return Path(root).expanduser()
+
+    # --- CLI plumbing -----------------------------------------------------
+    @staticmethod
+    def add_cli_args(parser: argparse.ArgumentParser) -> None:
+        """Register a --flag for every scalar config field (dashes for underscores)."""
+        defaults = Config()
+        for f in fields(Config):
+            if f.name.startswith("_") or f.name in {"babble_atten_db", "n_transients"}:
+                continue
+            default = getattr(defaults, f.name)
+            flag = "--" + f.name.replace("_", "-")
+            if f.type == "bool" or isinstance(default, bool):
+                parser.add_argument(
+                    flag, dest=f.name, action=argparse.BooleanOptionalAction, default=None
+                )
+            else:
+                parser.add_argument(flag, dest=f.name, default=None)
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> Config:
+        """Build a Config, coercing provided CLI strings to each field's type."""
+        defaults = cls()
+        kwargs: dict = {}
+        for f in fields(cls):
+            if f.name.startswith("_"):
+                continue
+            val = getattr(args, f.name, None)
+            if val is None:
+                continue
+            default = getattr(defaults, f.name)
+            if isinstance(default, bool):
+                kwargs[f.name] = bool(val)
+            elif isinstance(default, int) and not isinstance(default, bool):
+                kwargs[f.name] = int(val)
+            elif isinstance(default, float):
+                kwargs[f.name] = float(val)
+            else:
+                kwargs[f.name] = val
+        return cls(**kwargs)
