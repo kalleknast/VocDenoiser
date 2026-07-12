@@ -41,6 +41,10 @@ Simulate the lab husbandry environment using a weighted mixture:
 * 50% Synthetic Babble: Mix 5–10 attenuated, randomly shifted isolated calls from the dataset to simulate conspecific "chatter".
 * 10% Transients: Short white-noise bursts (5–20 ms) to simulate cage rattling.
 
+### Real recorded backgrounds (extension beyond this recipe)
+
+Training does **not** rely on synthetic noise alone: the synthetic bed above is blended with a **real recorded colony-noise** segment drawn per-example from `cfg.noise_dirs` (`data/Noise` = ventilation/colony background, `data/Cigarra` = cicada), at weight `cfg.real_noise_weight` (`0` = synthetic only, `1` = real only, default `0.5`). This exposes the model to the actual acoustic backgrounds, not just their synthetic approximation. Implemented in `augment.noise_bed` / `dataset.PheeDenoiseDataset`.
+
 ## Mixing Pipeline
 
 * Dynamic SNR: Relative levels between calls or signal-to-noise sampled uniformly from $-5$ dB to $+15$ dB.

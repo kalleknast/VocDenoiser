@@ -5,7 +5,8 @@ Each item:
   2. optionally apply a shared bioacoustic perturbation (pitch/stretch) — this
      becomes the aligned *call*;
   3. the perturbed call → clean log-mel (**target**);
-  4. call + synthetic colony-noise bed at a sampled SNR → noisy log-mel (**input**).
+  4. call + colony-noise bed (synthetic recipe blended with real recorded
+     backgrounds from ``cfg.noise_dirs``) at a sampled SNR → noisy log-mel (**input**).
 
 Augmentation RNG is derived per (base seed, epoch, index) so a given epoch is
 exactly replayable, yet every epoch re-randomises. Set ``cfg.augment = False``
@@ -18,6 +19,7 @@ training loop is the slow path this project explicitly avoids.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import torch
@@ -68,6 +70,18 @@ class PheeDenoiseDataset(Dataset):
         )
         self._to_db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80.0)
 
+        # Real recorded backgrounds, blended into the noise bed (see augment.noise_bed).
+        self._noise_files: list[tuple[str, int, int]] = []
+        if cfg.augment and cfg.real_noise_weight > 0.0:
+            self._noise_files = self._scan_noise_files()
+            if not self._noise_files:
+                dirs = [str(d) for d in cfg.resolved_noise_dirs()]
+                print(
+                    f"WARNING: real_noise_weight={cfg.real_noise_weight} but no WAVs found "
+                    f"under {dirs} — falling back to synthetic noise only. Point --noise-dirs "
+                    "at the recorded colony noise (e.g. /content/Noise /content/Cigarra)."
+                )
+
     def __len__(self) -> int:
         return len(self.files)
 
@@ -97,6 +111,46 @@ class PheeDenoiseDataset(Dataset):
             db = torch.nn.functional.pad(db, (0, self.cfg.n_frames - db.shape[1]))
         norm = (db - self.cfg.db_min) / (self.cfg.db_ref - self.cfg.db_min)
         return norm.clamp(0.0, 1.0).unsqueeze(0)
+
+    def _scan_noise_files(self) -> list[tuple[str, int, int]]:
+        """Index real-noise WAVs (path, n_frames, sr) via header metadata only."""
+        found: list[tuple[str, int, int]] = []
+        for d in self.cfg.resolved_noise_dirs():
+            if not d.is_dir():
+                continue
+            for p in sorted(d.rglob("*")):
+                if p.suffix.lower() != ".wav":
+                    continue
+                try:
+                    info = self._ta.info(str(p))
+                    if info.num_frames > 0:
+                        found.append((str(p), int(info.num_frames), int(info.sample_rate)))
+                except Exception:  # noqa: BLE001 - a bad noise file must not kill training
+                    continue
+        return found
+
+    def _real_background(self, n: int, generator: torch.Generator) -> torch.Tensor | None:
+        """A random ``n``-sample segment of a random real-noise recording (or None)."""
+        if not self._noise_files:
+            return None
+        path, total_frames, sr = self._noise_files[
+            augment._randint(0, len(self._noise_files) - 1, generator)
+        ]
+        tgt_sr = self.cfg.effective_sr
+        need = int(math.ceil(n * sr / tgt_sr)) + 1  # source frames -> ~n output samples
+        if total_frames <= need:
+            offset, num = 0, total_frames
+        else:
+            offset = augment._randint(0, total_frames - need, generator)
+            num = need
+        try:
+            wav, wsr = self._ta.load(path, frame_offset=offset, num_frames=num)
+        except Exception:  # noqa: BLE001
+            return None
+        wav = wav.mean(dim=0)  # mono
+        if wsr != tgt_sr:
+            wav = self._ta.functional.resample(wav, wsr, tgt_sr)
+        return augment._fit_length(wav.float(), n)
 
     def _babble_pool(self, index: int, generator: torch.Generator) -> list[torch.Tensor]:
         pool: list[torch.Tensor] = []
@@ -129,7 +183,8 @@ class PheeDenoiseDataset(Dataset):
             return clean_spec, clean_spec  # clean→clean for eval / latent extraction
 
         pool = self._babble_pool(index, g)
-        bed = augment.noise_bed(call.numel(), pool, cfg, g)
+        real_bg = self._real_background(call.numel(), g)
+        bed = augment.noise_bed(call.numel(), pool, cfg, g, real_bg=real_bg)
         snr_db = augment._uniform(cfg.snr_db_min, cfg.snr_db_max, g)
         noisy = augment.mix_at_snr(call, bed, snr_db)
         noisy_spec = self._log_mel(noisy)

@@ -35,9 +35,11 @@ class Config:
     # Root holding the *clean* isolated phee-call WAVs (the off-repo training
     # set — see CLAUDE.local.md). NOT data/Noise/, which is colony noise only.
     data_root: str | None = None
-    # Real colony-noise WAVs for optional real-noise augmentation. The synthetic
-    # recipe (augment.py) is the primary source; this is here for future mixing.
-    noise_root: str = "data/Noise"
+    # Real recorded colony-noise dirs, blended into the noise bed alongside the
+    # synthetic recipe (see ``real_noise_weight``). ``data/Noise`` = ventilation /
+    # colony background, ``data/Cigarra`` = cicada. Override on Colab, e.g.
+    # ``--noise-dirs /content/Noise /content/Cigarra``. WAV/.WAV, read per item.
+    noise_dirs: tuple[str, ...] = ("data/Noise", "data/Cigarra")
     # Glob used to discover clean calls under ``data_root`` (recursive).
     clean_glob: str = "**/*.wav"
 
@@ -69,10 +71,15 @@ class Config:
     seed: int = 42
 
     # --- Colony-noise recipe (SPECS.md / noise-recipe skill) --------------
-    # Composite noise-bed mixing weights: 40% pink, 50% babble, 10% transients.
+    # Composite SYNTHETIC noise-bed mixing weights: 40% pink, 50% babble, 10% transients.
     weight_pink: float = 0.40
     weight_babble: float = 0.50
     weight_transient: float = 0.10
+    # Blend of the REAL recorded background (from ``noise_dirs``) into the bed:
+    # 0 = synthetic only (the SPECS recipe), 1 = real recordings only, 0.5 = both
+    # equally. Extension beyond SPECS.md — real-noise mixing is a deliberate
+    # addition (natural cicada/colony backgrounds alongside the synthetic bed).
+    real_noise_weight: float = 0.50
     snr_db_min: float = -5.0  # dynamic SNR sampled uniformly in [-5, +15] dB
     snr_db_max: float = 15.0
     max_offset_ms: float = 500.0  # temporal offsets 0–500 ms between sources
@@ -132,6 +139,10 @@ class Config:
         root = self.data_root or os.environ.get(DATA_ROOT_ENV) or DEFAULT_DATA_ROOT
         return Path(root).expanduser()
 
+    def resolved_noise_dirs(self) -> list[Path]:
+        """Real-noise dirs as expanded Paths (may not all exist; caller checks)."""
+        return [Path(d).expanduser() for d in self.noise_dirs]
+
     # --- CLI plumbing -----------------------------------------------------
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -146,6 +157,8 @@ class Config:
                 parser.add_argument(
                     flag, dest=f.name, action=argparse.BooleanOptionalAction, default=None
                 )
+            elif isinstance(default, (list, tuple)):
+                parser.add_argument(flag, dest=f.name, nargs="+", default=None)
             else:
                 parser.add_argument(flag, dest=f.name, default=None)
 
@@ -163,6 +176,8 @@ class Config:
             default = getattr(defaults, f.name)
             if isinstance(default, bool):
                 kwargs[f.name] = bool(val)
+            elif isinstance(default, (list, tuple)):
+                kwargs[f.name] = tuple(val)
             elif isinstance(default, int) and not isinstance(default, bool):
                 kwargs[f.name] = int(val)
             elif isinstance(default, float):

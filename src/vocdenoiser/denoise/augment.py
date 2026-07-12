@@ -6,10 +6,17 @@ synthetic colony-noise bed is the **input**. Perturbations are applied to the
 call *before* it is split into target/input, so the pair stays time-aligned and
 only the additive noise differs.
 
-Noise-bed composition (energy-weighted, RMS-normalised components):
+Synthetic noise-bed composition (energy-weighted, RMS-normalised components):
   * 40 % pink noise (1/f)          — ventilation / AC
   * 50 % synthetic babble          — 5–10 attenuated, shifted conspecific calls
   * 10 % transients                — 5–20 ms white-noise bursts (cage rattling)
+
+**Real-noise blend (extension beyond SPECS.md).** The synthetic bed above is
+blended with a real recorded colony-noise segment (from ``cfg.noise_dirs`` —
+``data/Noise`` ventilation, ``data/Cigarra`` cicada) at weight
+``cfg.real_noise_weight`` so training sees the *actual* backgrounds, not only
+synthetic noise. Weight 0 reproduces the original synthetic-only recipe; this is
+a deliberate deviation from the SPECS recipe, flagged per the noise-recipe skill.
 
 Mixing: SNR ~ U(-5, +15) dB, temporal offset ~ U(0, 500) ms.
 Perturbations: pitch ±5 %, time stretch ±10 %.
@@ -120,14 +127,35 @@ def babble(
 
 
 def noise_bed(
-    n: int, call_pool: list[torch.Tensor], cfg: Config, generator: torch.Generator
+    n: int,
+    call_pool: list[torch.Tensor],
+    cfg: Config,
+    generator: torch.Generator,
+    real_bg: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Weighted composite colony-noise bed (unit-RMS), length ``n``."""
-    bed = (
+    """Colony-noise bed (unit-RMS), length ``n``.
+
+    The SPECS synthetic bed (40 % pink / 50 % babble / 10 % transients, each
+    unit-RMS, summed and RMS-normalised) is blended with a **real recorded
+    background** segment ``real_bg`` when given, at weight ``cfg.real_noise_weight``
+    (0 = synthetic only — the original recipe; 1 = real only; 0.5 = both equally).
+    Passing ``real_bg=None`` or weight 0 reproduces the synthetic-only recipe.
+    """
+    synth = (
         cfg.weight_pink * pink_noise(n, generator)
         + cfg.weight_babble * babble(n, call_pool, cfg, generator)
         + cfg.weight_transient * transient_burst(n, cfg, generator)
     )
+    if _rms(synth) > EPS:
+        synth = _normalise_rms(synth)
+
+    alpha = cfg.real_noise_weight
+    if real_bg is not None and alpha > 0.0 and _rms(real_bg) > EPS:
+        real = _normalise_rms(_fit_length(real_bg.float(), n))
+        bed = (1.0 - alpha) * synth + alpha * real
+    else:
+        bed = synth
+
     if _rms(bed) <= EPS:
         return bed
     return _normalise_rms(bed)
