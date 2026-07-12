@@ -76,6 +76,7 @@ def main(argv: list[str] | None = None) -> None:
         devices="auto",
         callbacks=[ckpt, _SetEpoch()],
         log_every_n_steps=10,
+        gradient_clip_val=1.0,  # cap step size so a bad batch can't blow the VAE up to NaN
     )
     trainer.fit(model, train_dl, val_dl)
     print(f"Best checkpoint: {ckpt.best_model_path}")

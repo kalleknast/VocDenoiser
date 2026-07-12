@@ -67,7 +67,11 @@ class BetaVAE(L.LightningModule):
     # --- core VAE ---------------------------------------------------------
     def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h = self.encoder(x).flatten(1)
-        return self.fc_mu(h), self.fc_logvar(h)
+        # Clamp logvar so exp(logvar) / exp(0.5·logvar) can't overflow to inf and
+        # NaN out the run (a single overshoot past logvar≈88 kills float32). The
+        # bounds are wide enough to never bind in a healthy run.
+        logvar = self.fc_logvar(h).clamp(-10.0, 10.0)
+        return self.fc_mu(h), logvar
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -94,11 +98,19 @@ class BetaVAE(L.LightningModule):
         logvar: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         mse = F.mse_loss(recon, target, reduction="mean")
-        # KL of q(z|x) ‖ N(0, I), averaged over the batch.
+        # KL of q(z|x) ‖ N(0, I): sum over latent dims, mean over the batch.
         kl = -0.5 * torch.mean(
             torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
         )
-        return mse + self.cfg.beta * kl, mse, kl
+        # Weight the reconstruction by the number of spectrogram bins so it is on
+        # the same scale as the latent-summed KL (equivalently: sum the Gaussian
+        # log-likelihood over bins). Without this, MSE averaged over ~32k bins is
+        # ~n_bins smaller than β·KL, so the objective is >99.9% KL and the model
+        # collapses the posterior instead of learning to denoise. `mse`/`kl` are
+        # still returned unweighted for readable logging.
+        n_bins = target[0].numel()
+        total = n_bins * mse + self.cfg.beta * kl
+        return total, mse, kl
 
     def _step(self, batch: tuple[torch.Tensor, torch.Tensor], stage: str) -> torch.Tensor:
         noisy, clean = batch
