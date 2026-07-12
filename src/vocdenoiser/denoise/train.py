@@ -70,7 +70,23 @@ def main(argv: list[str] | None = None) -> None:
         save_top_k=3,
         save_last=True,
     )
-    callbacks: list[Callback] = [ckpt, _SetEpoch()]
+    # Refresh the progress bar every 10 batches instead of every batch. In Colab's
+    # non-TTY output each redraw is emitted as fresh lines rather than overwritten
+    # in place, so a per-batch refresh floods the cell with thousands of lines;
+    # refresh_rate=10 cuts that 10x. Prefer the Rich bar when `rich` is installed
+    # (the nicer panel this run already renders), else the default tqdm bar.
+    try:
+        import rich  # noqa: F401
+
+        from lightning.pytorch.callbacks import RichProgressBar
+
+        progress_bar: Callback = RichProgressBar(refresh_rate=10)
+    except ModuleNotFoundError:
+        from lightning.pytorch.callbacks import TQDMProgressBar
+
+        progress_bar = TQDMProgressBar(refresh_rate=10)
+
+    callbacks: list[Callback] = [ckpt, _SetEpoch(), progress_bar]
     if cfg.early_stop_patience > 0:
         # Stop once val_loss stops improving; also halts on a non-finite val_loss
         # (check_finite defaults True), complementing the training-step NaN skip.
