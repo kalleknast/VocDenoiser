@@ -30,6 +30,10 @@ Expected layout under ``--imv-root`` (extract the five twin tarballs into it)::
 
 Usage::
 
+    # one-shot: download the ~21 GB audio from Zenodo, then cut clips + write CSV
+    python -m vocdenoiser.datasets.infantmarmosetsvox --download --target-sr 96000
+
+    # or, if the audio is already extracted under <imv-root>/data/twin_*/
     python -m vocdenoiser.datasets.infantmarmosetsvox \
         --imv-root data/labelled/InfantMarmosetsVox \
         --target-sr 96000
@@ -64,6 +68,10 @@ CALLTYPE_NAMES = {
 DROP_CALLTYPES = {11, 12}  # Silence, Noise
 
 DEFAULT_ROOT = "data/labelled/InfantMarmosetsVox"
+
+# Zenodo record 10130104 (CC-BY-4.0). The five twin tarballs total ~21 GB.
+IMV_ZENODO_BASE = "https://zenodo.org/records/10130104/files"
+ALL_TWINS = (1, 2, 3, 4, 5)
 
 
 @dataclass
@@ -243,6 +251,97 @@ def prepare(
     return summary
 
 
+def _fetch(url: str, dest: Path) -> None:
+    """Download ``url`` to ``dest``, resuming with curl when a partial exists."""
+    import shutil
+    import subprocess
+
+    if shutil.which("curl"):
+        cmd = ["curl", "-L", "--fail", "--retry", "3"]
+        if dest.exists() and dest.stat().st_size > 0:
+            cmd += ["-C", "-"]  # resume a partial download
+        cmd += ["-o", str(dest), url]
+        print(f"  downloading {dest.name} (curl)…")
+        subprocess.run(cmd, check=True)
+        return
+    # stdlib fallback (no resume): skip if something is already there.
+    if dest.exists() and dest.stat().st_size > 0:
+        print(f"  {dest.name} already present — skipping (urllib fallback cannot resume/verify).")
+        return
+    import urllib.request
+
+    print(f"  downloading {dest.name} (urllib)…")
+    with urllib.request.urlopen(url) as r, open(dest, "wb") as fh:  # noqa: S310 (trusted Zenodo URL)
+        shutil.copyfileobj(r, fh, 1 << 20)
+
+
+def _extract_tarball(tar_path: Path, dest_root: Path) -> None:
+    """Extract a .tar.gz into ``dest_root`` (path-traversal-safe on Python >= 3.12)."""
+    import tarfile
+
+    print(f"  extracting {tar_path.name}…")
+    with tarfile.open(tar_path, "r:gz") as tf:
+        try:
+            tf.extractall(dest_root, filter="data")  # Python 3.12+
+        except TypeError:
+            tf.extractall(dest_root)  # older Python: no data filter
+
+
+def _normalize_layout(imv_root: Path) -> int:
+    """Move any extracted ``twin_*`` dirs to ``<imv_root>/data/`` and surface labels.csv.
+
+    Makes the loader robust to whatever top-level prefix the archives use
+    (``InfantMarmosetsVox/data/twin_1``, ``data/twin_1``, or ``twin_1``). Returns
+    the number of twin directories relocated.
+    """
+    import shutil
+
+    data_dir = imv_root / "data"
+    data_dir.mkdir(exist_ok=True)
+    moved = 0
+    for p in list(imv_root.rglob("twin_*")):
+        if not p.is_dir() or p.parent == data_dir or "_downloads" in p.parts:
+            continue
+        if not any(p.rglob("*.wav")):
+            continue
+        target = data_dir / p.name
+        if target.exists():
+            continue
+        shutil.move(str(p), str(target))
+        moved += 1
+    if not (imv_root / "labels.csv").exists():
+        found = next((p for p in imv_root.rglob("labels.csv") if "_downloads" not in p.parts), None)
+        if found:
+            shutil.copy(str(found), str(imv_root / "labels.csv"))
+    return moved
+
+
+def download_imv(
+    imv_root: str | Path,
+    twins: tuple[int, ...] = ALL_TWINS,
+    keep_archives: bool = False,
+) -> None:
+    """Fetch + extract the InfantMarmosetsVox twin tarballs from Zenodo (~21 GB).
+
+    Each tarball is downloaded to ``<imv_root>/_downloads`` (curl resumes a partial
+    file), extracted, then deleted unless ``keep_archives``. Finally the layout is
+    normalized so audio lands at ``<imv_root>/data/twin_*/``.
+    """
+    imv_root = Path(imv_root)
+    dl_dir = imv_root / "_downloads"
+    dl_dir.mkdir(parents=True, exist_ok=True)
+    for t in twins:
+        name = f"InfantMarmosetsVox_twin_{t}.tar.gz"
+        dest = dl_dir / name
+        _fetch(f"{IMV_ZENODO_BASE}/{name}?download=1", dest)
+        _extract_tarball(dest, imv_root)
+        if not keep_archives:
+            dest.unlink(missing_ok=True)
+    moved = _normalize_layout(imv_root)
+    n_recordings = len(list((imv_root / "data").rglob("*.wav")))
+    print(f"Download complete: {moved} twin dirs normalized, {n_recordings} recordings under {imv_root/'data'}.")
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="Prepare InfantMarmosetsVox clips + id,identity CSV.")
     p.add_argument("--imv-root", default=DEFAULT_ROOT,
@@ -258,9 +357,22 @@ def main(argv: list[str] | None = None) -> None:
                    help="peak-normalize each clip (matches the reference Dataset)")
     p.add_argument("--limit", type=int, default=None, help="cap number of vocalizations (quick subset)")
     p.add_argument("--id-prefix", default="imv", help="clip id prefix")
+    p.add_argument("--download", action="store_true",
+                   help="fetch + extract the twin audio tarballs from Zenodo (~21 GB) first")
+    p.add_argument("--twins", type=int, nargs="+", default=list(ALL_TWINS),
+                   help="which twin tarballs to download (with --download)")
+    p.add_argument("--keep-archives", action="store_true",
+                   help="keep the downloaded .tar.gz files after extraction")
+    p.add_argument("--download-only", action="store_true",
+                   help="download + extract, then stop (skip clip preparation)")
     args = p.parse_args(argv)
 
     imv_root = Path(args.imv_root)
+    if args.download or args.download_only:
+        download_imv(imv_root, twins=tuple(args.twins), keep_archives=args.keep_archives)
+    if args.download_only:
+        return
+
     out_dir = args.out_dir or imv_root / "clips"
     out_csv = args.out_csv or imv_root / "imv_labels.csv"
     prepare(imv_root, out_dir, out_csv, target_sr=args.target_sr,

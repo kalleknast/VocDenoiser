@@ -127,8 +127,9 @@ per-call WAV clips (resampled to `--target-sr`, default 96 kHz to match the mode
 
 ```bash
 # InfantMarmosetsVox — the only open set with per-call CALLER IDENTITY (10 individuals).
-# Cuts labels.csv segments from the 350 ten-minute recordings; identity = caller.
-python -m vocdenoiser.datasets.infantmarmosetsvox --target-sr 96000
+# --download fetches+extracts the ~21 GB audio from Zenodo, then cuts labels.csv
+# segments from the 350 ten-minute recordings; identity = caller.
+python -m vocdenoiser.datasets.infantmarmosetsvox --download --target-sr 96000
 
 # MarmAudio — 96 kHz, ~215k clips labelled by CALL TYPE only (no caller identity).
 python -m vocdenoiser.datasets.marmaudio [--extract --target-sr 96000]

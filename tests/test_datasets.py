@@ -111,6 +111,32 @@ def test_imv_prepare_native_rate(tmp_path: Path):
     assert sr == 44100
 
 
+def test_imv_extract_and_normalize_layout(tmp_path: Path):
+    """A tarball with a top-level prefix lands its twin audio under data/twin_*/."""
+    import tarfile
+
+    # Build a tarball mimicking the Zenodo layout: InfantMarmosetsVox/data/twin_7/…
+    build = tmp_path / "build" / "InfantMarmosetsVox"
+    (build / "data" / "twin_7").mkdir(parents=True)
+    _write_wav(build / "data" / "twin_7" / "rec.wav", 0.1 * np.sin(np.arange(1000) / 5), 44100)
+    (build / "labels.csv").write_text("filename,start,end,duration,calltype,caller\n")
+    tar_path = tmp_path / "twin_7.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tf:
+        tf.add(build, arcname="InfantMarmosetsVox")
+
+    root = tmp_path / "IMV"
+    root.mkdir()
+    imv._extract_tarball(tar_path, root)
+    moved = imv._normalize_layout(root)
+
+    assert moved == 1
+    assert (root / "data" / "twin_7" / "rec.wav").exists()
+    assert (root / "labels.csv").exists()
+
+    # Idempotent: re-normalizing moves nothing.
+    assert imv._normalize_layout(root) == 0
+
+
 # ------------------------------- MarmAudio -------------------------------
 
 MA_ROWS = [
