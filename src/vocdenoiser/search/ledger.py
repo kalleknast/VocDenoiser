@@ -54,8 +54,15 @@ class Ledger:
         with open(self.path) as fh:
             for line in fh:
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                try:
                     out.append(Record(**json.loads(line)))
+                except (json.JSONDecodeError, TypeError):
+                    # Tolerate a torn final line from an interrupted append (e.g. a
+                    # Colab reset mid-write on a Drive-backed ledger); the append-only
+                    # log is otherwise intact, so skip and keep every complete record.
+                    continue
         return out
 
     def seen_ids(self) -> set[str]:

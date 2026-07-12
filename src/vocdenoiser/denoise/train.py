@@ -14,8 +14,46 @@ Copy the clean set to local disk first — do not train off the pCloud mount.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 from vocdenoiser.denoise.config import Config
+
+
+def _best_ckpt(ckpt_dir: Path) -> Path | None:
+    """Lowest-val_loss finite checkpoint in ``ckpt_dir`` (skips NaN-named files)."""
+    import re
+
+    cands = [
+        p for p in ckpt_dir.glob("betavae-*val_loss=*.ckpt") if "nan" not in p.name.lower()
+    ]
+    if not cands:
+        return None
+    return min(
+        cands, key=lambda p: float(re.search(r"val_loss=([0-9]+\.[0-9]+)", p.name).group(1))
+    )
+
+
+def _resolve_resume(resume_from: str | None, cfg: Config) -> str | None:
+    """Map ``--resume-from`` to a ``trainer.fit(ckpt_path=...)`` value (None = fresh)."""
+    if not resume_from:
+        return None
+    ckpt_dir = cfg.resolved_ckpt_dir()
+    if resume_from in ("auto", "last"):
+        last = ckpt_dir / "last.ckpt"
+        if last.exists():
+            print(f"Resuming full training state from {last}")
+            return str(last)
+        print(f"--resume-from {resume_from}: no last.ckpt in {ckpt_dir} — starting fresh.")
+        return None
+    if resume_from == "best":
+        best = _best_ckpt(ckpt_dir)
+        if best is not None:
+            print(f"Resuming from best checkpoint {best}")
+            return str(best)
+        print(f"--resume-from best: no finite checkpoint in {ckpt_dir} — starting fresh.")
+        return None
+    print(f"Resuming from {resume_from}")
+    return resume_from
 
 
 def build_dataloaders(cfg: Config):
@@ -58,7 +96,15 @@ def main(argv: list[str] | None = None) -> None:
 
     parser = argparse.ArgumentParser(description="Train the β-VAE phee denoiser.")
     Config.add_cli_args(parser)
-    cfg = Config.from_args(parser.parse_args(argv))
+    parser.add_argument(
+        "--resume-from",
+        default=None,
+        help="resume training: 'auto'/'last' (last.ckpt if present, else fresh), "
+        "'best' (lowest-val_loss ckpt), or an explicit .ckpt path. Checkpoints live "
+        "under --output-root / $VOCDENOISER_OUTPUT_ROOT, so this resumes across resets.",
+    )
+    args = parser.parse_args(argv)
+    cfg = Config.from_args(args)
 
     train_ds, train_dl, val_dl = build_dataloaders(cfg)
     model = BetaVAE(cfg)
@@ -68,7 +114,7 @@ def main(argv: list[str] | None = None) -> None:
             train_ds.set_epoch(trainer.current_epoch)
 
     ckpt = ModelCheckpoint(
-        dirpath=cfg.ckpt_dir,
+        dirpath=str(cfg.resolved_ckpt_dir()),
         filename="betavae-{epoch:02d}-{val_loss:.4f}",
         monitor="val_loss",
         mode="min",
@@ -111,7 +157,7 @@ def main(argv: list[str] | None = None) -> None:
         log_every_n_steps=10,
         gradient_clip_val=1.0,  # cap step size so a bad batch can't blow the VAE up to NaN
     )
-    trainer.fit(model, train_dl, val_dl)
+    trainer.fit(model, train_dl, val_dl, ckpt_path=_resolve_resume(args.resume_from, cfg))
     print(f"Best checkpoint: {ckpt.best_model_path}")
 
 

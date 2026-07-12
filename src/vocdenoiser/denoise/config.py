@@ -26,6 +26,11 @@ DATA_ROOT_ENV = "VOCDENOISER_DATA_ROOT"
 # so it stays portable across Colab / local box.
 DEFAULT_DATA_ROOT = "data/Vocalizations"
 
+# Env-var fallback for the durable-OUTPUT root (checkpoints, search ledger, SNR
+# scans). Set it to a mounted Drive folder on Colab so progress survives a runtime
+# reset; unset -> outputs stay repo-relative and the local box is unaffected.
+OUTPUT_ROOT_ENV = "VOCDENOISER_OUTPUT_ROOT"
+
 
 @dataclass
 class Config:
@@ -82,6 +87,10 @@ class Config:
     num_workers: int = 4
     val_frac: float = 0.1
     ckpt_dir: str = "checkpoints"
+    # Root for durable OUTPUTS. Resolved --output-root > $VOCDENOISER_OUTPUT_ROOT >
+    # "." (repo-relative). Point at a Drive mount on Colab so checkpoints survive a
+    # reset; never hardcoded, so the same command runs locally unchanged.
+    output_root: str | None = None
     seed: int = 42
 
     # --- Colony-noise recipe (SPECS.md / noise-recipe skill) --------------
@@ -156,6 +165,15 @@ class Config:
     def resolved_noise_dirs(self) -> list[Path]:
         """Real-noise dirs as expanded Paths (may not all exist; caller checks)."""
         return [Path(d).expanduser() for d in self.noise_dirs]
+
+    def resolved_output_root(self) -> Path:
+        """Durable-output root: --output-root > $VOCDENOISER_OUTPUT_ROOT > CWD."""
+        root = self.output_root or os.environ.get(OUTPUT_ROOT_ENV)
+        return Path(root).expanduser() if root else Path(".")
+
+    def resolved_ckpt_dir(self) -> Path:
+        """Checkpoint dir under the output root (an absolute ``ckpt_dir`` overrides)."""
+        return self.resolved_output_root() / self.ckpt_dir
 
     # --- CLI plumbing -----------------------------------------------------
     @staticmethod

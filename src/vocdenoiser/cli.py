@@ -19,6 +19,18 @@ def _snr_params(args) -> SNRParams:
     return SNRParams(n_fft=args.n_fft, hop=args.hop, active_db=args.active_db)
 
 
+def _resolve_ledger(path: str | None) -> str:
+    """Default the search ledger under $VOCDENOISER_OUTPUT_ROOT (see
+    ``config.OUTPUT_ROOT_ENV``) so it lands on a mounted Drive folder when that is
+    set and the search resumes across resets; an explicit --ledger always wins."""
+    if path:
+        return path
+    import os
+
+    root = os.environ.get("VOCDENOISER_OUTPUT_ROOT") or "."
+    return os.path.join(root, "artifacts", "search_ledger.jsonl")
+
+
 def _add_stft_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--n-fft", type=int, default=1024)
     p.add_argument("--hop", type=int, default=256)
@@ -96,7 +108,7 @@ def cmd_search_run(args) -> None:
             overrides["noise_dirs"] = tuple(args.noise_dirs)
         harness = TorchHarness(base_config_overrides=overrides, max_steps=args.max_steps)
 
-    ledger = Ledger(args.ledger)
+    ledger = Ledger(_resolve_ledger(args.ledger))
     proposer = Proposer(frontier_k=args.frontier_k)
     cfg = SearchConfig(
         iters=args.iters,
@@ -113,7 +125,7 @@ def cmd_search_run(args) -> None:
 def cmd_search_report(args) -> None:
     from vocdenoiser.search.report import build_report
 
-    print(build_report(args.ledger))
+    print(build_report(_resolve_ledger(args.ledger)))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -176,7 +188,9 @@ def build_parser() -> argparse.ArgumentParser:
     sr = search_sub.add_parser("run", help="run the search loop")
     sr.add_argument("--harness", choices=["mock", "torch"], default="mock",
                     help="mock = synthetic landscape (no GPU); torch = real training")
-    sr.add_argument("--ledger", default="artifacts/search_ledger.jsonl")
+    sr.add_argument("--ledger", default=None,
+                    help="ledger JSONL path; default artifacts/search_ledger.jsonl under "
+                         "$VOCDENOISER_OUTPUT_ROOT (Drive on Colab) so the search resumes")
     sr.add_argument("--iters", type=int, default=40)
     sr.add_argument("--seeds", type=int, nargs="+", default=[0, 1])
     sr.add_argument("--k-sigma", type=float, default=1.0)
@@ -190,7 +204,9 @@ def build_parser() -> argparse.ArgumentParser:
     sr.set_defaults(func=cmd_search_run)
 
     srep = search_sub.add_parser("report", help="summarise a search ledger")
-    srep.add_argument("--ledger", default="artifacts/search_ledger.jsonl")
+    srep.add_argument("--ledger", default=None,
+                      help="ledger JSONL path (default: same $VOCDENOISER_OUTPUT_ROOT "
+                           "location as `search run`)")
     srep.set_defaults(func=cmd_search_report)
 
     return parser
