@@ -28,7 +28,13 @@ def _norm(kind: str, ch: int) -> nn.Module:
     if kind == "batch":
         return nn.BatchNorm2d(ch)
     if kind == "group":
-        return nn.GroupNorm(min(8, ch), ch)
+        # GroupNorm needs num_groups | ch, but ch = round(base_channels*channel_mult**i)
+        # can be any integer (e.g. 300). Use the largest divisor of ch that is <= 8
+        # rather than a fixed 8, which crashed whenever ch was not a multiple of 8.
+        groups = min(8, ch)
+        while ch % groups:
+            groups -= 1
+        return nn.GroupNorm(groups, ch)
     return nn.Identity()
 
 

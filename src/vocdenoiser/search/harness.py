@@ -130,13 +130,17 @@ class TorchHarness:
         t0 = time.time()
         for seed in seeds:
             torch.manual_seed(seed)
-            overrides = {**self.base_overrides, **c.to_config_overrides(), "seed": seed}
-            cfg = Config(**overrides)
-            model = build_search_model(c, cfg)
-            nparams = sum(p.numel() for p in model.parameters())
-            _train_ds, train_dl, val_dl = build_dataloaders(cfg)
             try:
                 import lightning as L
+
+                # Build inside the try as well: a candidate whose architecture fails to
+                # construct (e.g. an invalid GroupNorm group count or kernel combo) must be
+                # recorded as a crashed candidate, not abort the entire search.
+                overrides = {**self.base_overrides, **c.to_config_overrides(), "seed": seed}
+                cfg = Config(**overrides)
+                model = build_search_model(c, cfg)
+                nparams = sum(p.numel() for p in model.parameters())
+                _train_ds, train_dl, val_dl = build_dataloaders(cfg)
 
                 if torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats()
