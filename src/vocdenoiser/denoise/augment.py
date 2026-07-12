@@ -174,10 +174,10 @@ def pitch_shift(wav: torch.Tensor, cfg: Config, generator: torch.Generator) -> t
 
     Phase-vocoder time-stretch followed by a **bounded-ratio** resample. We do NOT
     use ``torchaudio.functional.pitch_shift``: it resamples with
-    ``int(sample_rate / rate)`` as a frequency, which at 96 kHz is almost always
-    coprime with the sample rate, so torchaudio builds a resampling kernel of many
-    GB and OOM-kills the dataloader worker. Quantising the resample ratio to
-    ``p / RESAMPLE_Q`` keeps the kernel tiny (a few hundred KB).
+    ``int(sample_rate / rate)`` as a frequency, which at typical sample rates is
+    almost always coprime with the sample rate, so torchaudio builds a resampling
+    kernel of many GB and OOM-kills the dataloader worker. Quantising the resample
+    ratio to ``p / RESAMPLE_Q`` keeps the kernel tiny (a few hundred KB).
     """
     import torchaudio.functional as AF
 

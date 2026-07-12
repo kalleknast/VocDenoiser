@@ -29,6 +29,9 @@ ml = [
 ]
 # Optional hyperparameter search backends for the continuous knobs.
 search = ["optuna>=3.4"]
+# Anti-aliased polyphase resampling for the dataset downsampler / external
+# loaders (falls back to torchaudio when the ml extra is installed).
+resample = ["scipy>=1.10"]
 dev = ["pytest>=7", "ruff>=0.4"]
 
 [project.scripts]

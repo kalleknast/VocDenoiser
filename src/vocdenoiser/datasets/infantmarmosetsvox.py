@@ -13,11 +13,11 @@ identity?" proxy: a different colony (infant twins) at a different native rate
 than our own ``data/Vocalizations``, so read the RandomForest accuracy as a
 cross-dataset check, not a number comparable to an in-domain split.
 
-**Sample-rate caveat.** IMV is captured at 44.1 kHz (content <= ~22 kHz). Our
-β-VAE is trained at 96 kHz and its mel geometry is fixed to ``effective_sr``, so
-clips must be emitted at that rate (``--target-sr 96000``, the default) to be
-drop-in for eval. Upsampling leaves the 22-48 kHz band empty — inherent domain
-shift, not a bug; most phee energy sits below 22 kHz so call structure survives.
+**Sample rate.** IMV is captured at 44.1 kHz, which now *matches* the model's
+working rate (``effective_sr``, see ``config.Config.sr``), so ``--target-sr 44100``
+(the default) is a no-op resample and the clips are drop-in for eval — no upsample
+and no empty high-frequency band. (When the model ran at 96 kHz this loader had to
+upsample, leaving a dead 22-48 kHz band; operating at 44.1 removes that artifact.)
 
 Expected layout under ``--imv-root`` (extract the five twin tarballs into it)::
 
@@ -31,12 +31,12 @@ Expected layout under ``--imv-root`` (extract the five twin tarballs into it)::
 Usage::
 
     # one-shot: download the ~21 GB audio from Zenodo, then cut clips + write CSV
-    python -m vocdenoiser.datasets.infantmarmosetsvox --download --target-sr 96000
+    python -m vocdenoiser.datasets.infantmarmosetsvox --download --target-sr 44100
 
     # or, if the audio is already extracted under <imv-root>/data/twin_*/
     python -m vocdenoiser.datasets.infantmarmosetsvox \
         --imv-root data/labelled/InfantMarmosetsVox \
-        --target-sr 96000
+        --target-sr 44100
 
 Then run the identity proxy::
 
@@ -209,7 +209,7 @@ def prepare(
     imv_root: str | Path,
     out_dir: str | Path,
     out_csv: str | Path,
-    target_sr: int = 96_000,
+    target_sr: int = 44_100,
     peak_normalize: bool = False,
     limit: int | None = None,
     id_prefix: str = "imv",
@@ -414,9 +414,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="output clips dir [default <imv-root>/clips]")
     p.add_argument("--out-csv", default=None,
                    help="output labels CSV [default <imv-root>/imv_labels.csv]")
-    p.add_argument("--target-sr", type=int, default=96_000,
+    p.add_argument("--target-sr", type=int, default=44_100,
                    help="resample clips to this rate; 0 keeps native 44.1 kHz. "
-                        "Set to your model's effective_sr (default 96000).")
+                        "Match your model's effective_sr (default 44100 = IMV native, no-op).")
     p.add_argument("--peak-normalize", action="store_true",
                    help="peak-normalize each clip (matches the reference Dataset)")
     p.add_argument("--limit", type=int, default=None, help="cap number of vocalizations (quick subset)")

@@ -28,10 +28,11 @@ Usage::
     python -m vocdenoiser.datasets.marmaudio \
         --annotations data/labelled/MarmAudio/Annotations.tsv
 
-    # also decode the labelled FLAC clips to 96 kHz WAV for eval:
+    # also decode the labelled FLAC clips to WAV at the model's rate for eval
+    # (MarmAudio is native 96 kHz; --target-sr 44100 downsamples to match the model):
     python -m vocdenoiser.datasets.marmaudio --extract \
         --flac-dir data/labelled/MarmAudio/Vocalizations \
-        --extract-dir data/labelled/MarmAudio/clips --target-sr 96000
+        --extract-dir data/labelled/MarmAudio/clips --target-sr 44100
 """
 
 from __future__ import annotations
@@ -163,7 +164,7 @@ def extract_clips(
     clips: list[LabeledClip],
     flac_dir: str | Path,
     out_dir: str | Path,
-    target_sr: int = 96_000,
+    target_sr: int = 44_100,
     quality: bool = True,
     out_csv: str | Path | None = None,
     min_snr: float | None = None,
@@ -263,8 +264,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="dir holding the FLAC clips (for --extract)")
     p.add_argument("--extract-dir", default=f"{DEFAULT_ROOT}/clips",
                    help="output dir for decoded WAV clips (for --extract)")
-    p.add_argument("--target-sr", type=int, default=96_000,
-                   help="resample decoded clips to this rate; 0 keeps native (for --extract)")
+    p.add_argument("--target-sr", type=int, default=44_100,
+                   help="resample decoded clips to this rate (match model effective_sr; "
+                        "MarmAudio is native 96 kHz); 0 keeps native (for --extract)")
     # Call-quality (only with --extract, since it needs the decoded audio):
     p.add_argument("--no-quality", dest="quality", action="store_false",
                    help="skip per-clip quality scoring during --extract")

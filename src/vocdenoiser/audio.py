@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
-__all__ = ["read_wav", "hann_window", "stft", "power_spectrogram"]
+__all__ = ["read_wav", "write_wav", "hann_window", "stft", "power_spectrogram"]
 
 
 def read_wav(path: str | Path) -> tuple[np.ndarray, int]:
@@ -78,6 +78,16 @@ def read_wav_segment(path: str | Path, start: int, length: int) -> tuple[np.ndar
     if n_channels > 1:
         data = data.reshape(-1, n_channels).mean(axis=1)
     return data, sr
+
+
+def write_wav(path: str | Path, y: np.ndarray, sr: int) -> None:
+    """Write a mono float array in [-1, 1] to a 16-bit PCM WAV (stdlib only)."""
+    i16 = (np.clip(np.asarray(y, dtype=np.float32), -1.0, 1.0) * 32767.0).astype("<i2")
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(int(sr))
+        w.writeframes(i16.tobytes())
 
 
 def wav_num_frames(path: str | Path) -> int:

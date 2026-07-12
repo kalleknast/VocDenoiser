@@ -44,13 +44,22 @@ class Config:
     clean_glob: str = "**/*.wav"
 
     # --- Audio / spectrogram ---------------------------------------------
-    sr: int = 96_000  # source rate (96 kHz mono 16-bit PCM per SPECS)
-    resample_sr: int | None = None  # if set, resample to this rate before STFT
+    # Working rate. The archive is 96 kHz 16-bit PCM (SPECS.md), but phee energy is
+    # essentially all below ~22 kHz, so we operate at 44.1 kHz: 2.2x less data/IO,
+    # finer in-band mel resolution, and a native rate match to InfantMarmosetsVox
+    # (no upsample artifact in the cross-dataset benchmark). DEVIATION from SPECS.md's
+    # 96 kHz — flagged deliberately.
+    sr: int = 44_100
+    # Safety net: any WAV whose header rate != this is resampled to it before the
+    # STFT, so a stray 96 kHz file (e.g. the un-downsampled original archive) is
+    # auto-converted; a no-op on audio already at 44.1 kHz. Pre-downsample with
+    # `python -m vocdenoiser.datasets.resample` to skip the per-item resample cost.
+    resample_sr: int | None = 44_100
     n_fft: int = 1024
-    hop: int = 512
+    hop: int = 256
     n_mels: int = 128
-    n_frames: int = 256  # fixed time dimension (crop/pad); ~1.4 s at 96 kHz/hop 512
-    f_min: float = 50.0
+    n_frames: int = 256  # fixed time dimension (crop/pad); ~1.5 s at 44.1 kHz / hop 256
+    f_min: float = 1000.0  # phee energy is >~5 kHz; also avoids empty low-freq mel bands
     f_max: float | None = None  # None -> effective_sr / 2
     # Log-mel dB normalisation window: (db - db_min) / (db_ref - db_min), clamped.
     db_ref: float = 0.0
