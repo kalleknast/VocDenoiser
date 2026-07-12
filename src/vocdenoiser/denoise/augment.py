@@ -170,13 +170,34 @@ def mix_at_snr(
 
 
 def pitch_shift(wav: torch.Tensor, cfg: Config, generator: torch.Generator) -> torch.Tensor:
-    """Pitch-shift by a random ±``pitch_pct`` %, via torchaudio's phase vocoder."""
+    """Pitch-shift by a random ±``pitch_pct`` %, duration preserved.
+
+    Phase-vocoder time-stretch followed by a **bounded-ratio** resample. We do NOT
+    use ``torchaudio.functional.pitch_shift``: it resamples with
+    ``int(sample_rate / rate)`` as a frequency, which at 96 kHz is almost always
+    coprime with the sample rate, so torchaudio builds a resampling kernel of many
+    GB and OOM-kills the dataloader worker. Quantising the resample ratio to
+    ``p / RESAMPLE_Q`` keeps the kernel tiny (a few hundred KB).
+    """
     import torchaudio.functional as AF
 
     ratio = 1.0 + _uniform(-cfg.pitch_pct, cfg.pitch_pct, generator) / 100.0
-    n_steps = 12.0 * math.log2(ratio)  # percent -> semitones
-    shifted = AF.pitch_shift(wav.unsqueeze(0), cfg.effective_sr, n_steps)
-    return shifted.squeeze(0)
+    if abs(ratio - 1.0) < 1e-3:
+        return wav
+    n_fft, hop = 512, 128
+    window = torch.hann_window(n_fft)
+    spec = torch.stft(wav, n_fft, hop, window=window, return_complex=True)
+    freq = spec.shape[-2]
+    phase_advance = torch.linspace(0, math.pi * hop, freq)[..., None]
+    # Lengthen by `ratio` (pitch preserved): phase_vocoder rate < 1 lengthens.
+    longer = torch.istft(
+        AF.phase_vocoder(spec.unsqueeze(0), 1.0 / ratio, phase_advance).squeeze(0),
+        n_fft, hop, window=window,
+    )
+    # Decimate by ~`ratio` via a bounded rational p/q -> pitch up, duration ≈ restored.
+    q = 100
+    p = max(1, int(round(ratio * q)))
+    return AF.resample(longer, orig_freq=p, new_freq=q)
 
 
 def time_stretch(wav: torch.Tensor, cfg: Config, generator: torch.Generator) -> torch.Tensor:

@@ -22,6 +22,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
@@ -113,7 +114,15 @@ class PheeDenoiseDataset(Dataset):
         return norm.clamp(0.0, 1.0).unsqueeze(0)
 
     def _scan_noise_files(self) -> list[tuple[str, int, int]]:
-        """Index real-noise WAVs (path, n_frames, sr) via header metadata only."""
+        """Index real-noise WAVs (path, n_frames, sr) via the stdlib header read.
+
+        Uses ``vocdenoiser.audio`` (stdlib ``wave``), NOT ``torchaudio.info`` — on
+        some Colab torchaudio builds the latter fails to probe the uppercase
+        ``.WAV`` colony-noise files (returning 0 frames), so no real noise is found.
+        This is the same reader the SNR pipeline already uses on these files.
+        """
+        from vocdenoiser.audio import wav_meta
+
         found: list[tuple[str, int, int]] = []
         for d in self.cfg.resolved_noise_dirs():
             if not d.is_dir():
@@ -122,35 +131,33 @@ class PheeDenoiseDataset(Dataset):
                 if p.suffix.lower() != ".wav":
                     continue
                 try:
-                    info = self._ta.info(str(p))
-                    if info.num_frames > 0:
-                        found.append((str(p), int(info.num_frames), int(info.sample_rate)))
+                    sr, n_frames = wav_meta(p)
                 except Exception:  # noqa: BLE001 - a bad noise file must not kill training
                     continue
+                if n_frames > 0:
+                    found.append((str(p), int(n_frames), int(sr)))
         return found
 
     def _real_background(self, n: int, generator: torch.Generator) -> torch.Tensor | None:
         """A random ``n``-sample segment of a random real-noise recording (or None)."""
         if not self._noise_files:
             return None
+        from vocdenoiser.audio import read_wav_segment, resample_linear
+
         path, total_frames, sr = self._noise_files[
             augment._randint(0, len(self._noise_files) - 1, generator)
         ]
         tgt_sr = self.cfg.effective_sr
-        need = int(math.ceil(n * sr / tgt_sr)) + 1  # source frames -> ~n output samples
-        if total_frames <= need:
-            offset, num = 0, total_frames
-        else:
-            offset = augment._randint(0, total_frames - need, generator)
-            num = need
+        need = int(math.ceil(n * sr / tgt_sr)) + 1  # native frames -> ~n output samples
+        offset = 0 if total_frames <= need else augment._randint(0, total_frames - need, generator)
         try:
-            wav, wsr = self._ta.load(path, frame_offset=offset, num_frames=num)
+            seg, ssr = read_wav_segment(path, offset, need)  # numpy float32 in [-1, 1]
         except Exception:  # noqa: BLE001
             return None
-        wav = wav.mean(dim=0)  # mono
-        if wsr != tgt_sr:
-            wav = self._ta.functional.resample(wav, wsr, tgt_sr)
-        return augment._fit_length(wav.float(), n)
+        if ssr != tgt_sr:
+            seg = resample_linear(seg, n)  # crude but fine for a noise background
+        wav = torch.from_numpy(np.ascontiguousarray(seg, dtype=np.float32))
+        return augment._fit_length(wav, n)
 
     def _babble_pool(self, index: int, generator: torch.Generator) -> list[torch.Tensor]:
         pool: list[torch.Tensor] = []

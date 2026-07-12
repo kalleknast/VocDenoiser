@@ -87,6 +87,31 @@ def test_noise_bed_weight_zero_ignores_real():
     assert torch.allclose(with_real, without)  # weight 0 == original synthetic recipe
 
 
+def test_pitch_shift_no_kernel_blowup_at_96k():
+    """The reimplemented pitch shift must not build a giant resample kernel (OOM)."""
+    from vocdenoiser.denoise import augment
+
+    cfg = _tiny_cfg(sr=96_000, pitch_pct=5.0)
+    g = torch.Generator().manual_seed(3)
+    wav = torch.randn(48_000)  # ~0.5 s at 96 kHz
+    out = augment.pitch_shift(wav, cfg, g)
+    assert torch.isfinite(out).all() and out.numel() > 0
+
+
+def _write_pcm_wav(path, y, sr):
+    """16-bit PCM mono WAV via the stdlib (matches the real colony-noise files)."""
+    import wave
+
+    import numpy as np
+
+    i16 = (np.clip(np.asarray(y), -1, 1) * 32767).astype("<i2")
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(i16.tobytes())
+
+
 def test_dataset_scans_and_mixes_real_noise(tmp_path):
     import torchaudio
 
@@ -100,12 +125,11 @@ def test_dataset_scans_and_mixes_real_noise(tmp_path):
         calls.append(p)
     ndir = tmp_path / "Noise"
     ndir.mkdir()
-    torchaudio.save(str(ndir / "bg.wav"), 0.3 * torch.randn(1, sr), sr)
-    (ndir / "bg.wav").rename(ndir / "bg.WAV")  # real data uses uppercase .WAV
+    _write_pcm_wav(ndir / "bg.WAV", 0.3 * torch.randn(sr).numpy(), sr)  # uppercase .WAV, 16-bit PCM
 
     cfg = _tiny_cfg(sr=sr, noise_dirs=(str(ndir),), real_noise_weight=0.5)
     ds = PheeDenoiseDataset(cfg, calls)
-    assert len(ds._noise_files) == 1  # found the .WAV via case-insensitive scan
+    assert len(ds._noise_files) == 1  # found the uppercase .WAV via the stdlib header read
 
     bg = ds._real_background(cfg.waveform_len, torch.Generator().manual_seed(0))
     assert bg is not None and bg.numel() == cfg.waveform_len
