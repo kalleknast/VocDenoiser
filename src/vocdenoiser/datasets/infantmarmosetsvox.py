@@ -316,10 +316,27 @@ def prepare(
 
 
 def _fetch(url: str, dest: Path) -> None:
-    """Download ``url`` to ``dest``, resuming with curl when a partial exists."""
+    """Download ``url`` to ``dest``, resuming a partial.
+
+    Prefers ``aria2c`` (16 parallel connections): Zenodo throttles hard per
+    connection, so single-stream curl crawls at <1 MB/s while aria2c saturates the
+    link. Falls back to curl, then urllib.
+    """
     import shutil
     import subprocess
 
+    if shutil.which("aria2c"):
+        print(f"  downloading {dest.name} (aria2c, 16 connections)…")
+        subprocess.run(
+            [
+                "aria2c", "-x", "16", "-s", "16", "-k", "1M",
+                "--continue=true", "--auto-file-renaming=false",
+                "--allow-overwrite=true", "--max-tries=5", "--retry-wait=5",
+                "--summary-interval=15", "-d", str(dest.parent), "-o", dest.name, url,
+            ],
+            check=True,
+        )
+        return
     if shutil.which("curl"):
         cmd = ["curl", "-L", "--fail", "--retry", "3"]
         if dest.exists() and dest.stat().st_size > 0:
@@ -380,6 +397,18 @@ def _normalize_layout(imv_root: Path) -> int:
     return moved
 
 
+def _twin_extracted(imv_root: Path, t: int) -> bool:
+    """True if twin ``t``'s recordings are already on disk (resumable re-runs).
+
+    Matches the twin dir wherever the archive placed it (pre- or post-layout
+    normalization), ignoring the ``_downloads`` staging area.
+    """
+    for p in imv_root.rglob(f"twin_{t}"):
+        if p.is_dir() and "_downloads" not in p.parts and any(p.rglob("*.wav")):
+            return True
+    return False
+
+
 def download_imv(
     imv_root: str | Path,
     twins: tuple[int, ...] = ALL_TWINS,
@@ -395,6 +424,9 @@ def download_imv(
     dl_dir = imv_root / "_downloads"
     dl_dir.mkdir(parents=True, exist_ok=True)
     for t in twins:
+        if _twin_extracted(imv_root, t):
+            print(f"  twin_{t} already extracted — skipping download.")
+            continue
         name = f"InfantMarmosetsVox_twin_{t}.tar.gz"
         dest = dl_dir / name
         _fetch(f"{IMV_ZENODO_BASE}/{name}?download=1", dest)
