@@ -61,6 +61,14 @@ def _load_label_map(csv_path: str, key_col: str, val_col: str) -> dict[str, str]
 def _resolve_labels(files: list[Path], args) -> list[str | None]:
     """Per-file identity label (None where unknown), from CSV or the path scheme."""
     if args.labels_csv:
+        if not Path(args.labels_csv).is_file():
+            print(
+                f"--labels-csv {args.labels_csv} not found — rendering the UMAP without "
+                "identity colours and skipping the RandomForest proxy. Pass an existing "
+                "(id,identity) CSV to enable it (data/Vocalizations has no identities in "
+                "its filenames, so the in-domain UMAP is unlabelled by design)."
+            )
+            return [None] * len(files)
         lmap = _load_label_map(args.labels_csv, args.labels_key_col, args.labels_value_col)
         labels = [lmap.get(p.stem, lmap.get(p.name)) for p in files]
         n_missing = sum(label is None for label in labels)
