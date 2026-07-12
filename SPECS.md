@@ -12,6 +12,17 @@ Platform: Google Colab (PyTorch/Lightning).
 
 Hardware Target: NVIDIA A100 or L4 GPU.
 
+## Audio & Spectrogram Representation
+
+* Source audio: 96 kHz, mono, 16-bit PCM (isolated phee calls ~0.5 s; colony-noise clips ~60 s).
+* Working sample rate: **44.1 kHz**. Phee-call energy is essentially all below ~22 kHz, so the 96 kHz source is downsampled (anti-aliased) to 44.1 kHz for training and inference. This roughly halves data/IO, gives finer in-band mel resolution for a fixed spectrogram size, and matches the native rate of the InfantMarmosetsVox identity benchmark (removing the upsampling artifact). *Earlier revisions of this spec operated at 96 kHz.*
+* Representation: log-mel spectrogram.
+  * STFT: `n_fft = 1024`, `hop = 256` (~5.8 ms frames, 75% overlap), Hann window.
+  * Mel: `n_mels = 128` over `f_min = 1000 Hz` … `f_max = 22050 Hz` (Nyquist). A non-zero `f_min` keeps the model on the phee band and avoids empty low-frequency filterbanks.
+  * Fixed geometry: `n_frames = 256` (crop/pad) → input tensor `(1, 128, 256)`, ≈1.48 s. `n_mels` and `n_frames` are divisible by the encoder's `2⁴` downsample so the decoder reconstructs the exact shape.
+  * Power mel → dB → normalized to `[0, 1]` via `(dB − dB_min)/(dB_ref − dB_min)`, clamped.
+* All constants live in `denoise/config.py` (nothing hardcoded). The dataset resamples any non-44.1 kHz input on load as a safety net; `datasets/resample.py` pre-builds a 44.1 kHz copy of a set to skip that cost.
+
 ## Architecture
 
 * Type: 2D Convolutional $\beta$-Variational Autoencoder.
@@ -28,6 +39,7 @@ Input is a noisy phee; target is the clean ground-truth phee.
 $$L_{VAE} = \text{MSE}(\hat{x}, x) + \beta \cdot D_{KL}(q(z|x) \| p(z))$$
 
 * Denoising Strategy: Supervised Noisy-to-Clean mapping.
+* Term scaling (implementation): the reconstruction term is **summed over spectrogram bins** (equivalently, per-bin MSE × `n_bins`) so it shares a scale with the latent-summed KL. Without this, MSE averaged over ~32k bins is dwarfed by $\beta \cdot D_{KL}$, the objective becomes >99% KL, and the posterior collapses instead of learning to denoise. For numerical stability `logvar` is clamped and gradients are clipped, so a single degenerate batch cannot NaN the run.
 
 ## Data Augmentation & Noise Simulation
 
