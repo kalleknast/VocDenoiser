@@ -47,9 +47,14 @@ def build_dataloaders(cfg: Config):
 
 def main(argv: list[str] | None = None) -> None:
     import lightning as L
+    import torch
     from lightning.pytorch.callbacks import Callback, EarlyStopping, ModelCheckpoint
 
     from vocdenoiser.denoise.beta_vae import BetaVAE
+
+    # TF32 matmuls on Tensor-Core GPUs (L4/A100): a throughput win at negligible
+    # precision cost for this task; harmless no-op on CPU/other GPUs.
+    torch.set_float32_matmul_precision("high")
 
     parser = argparse.ArgumentParser(description="Train the β-VAE phee denoiser.")
     Config.add_cli_args(parser)

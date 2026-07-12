@@ -115,6 +115,10 @@ class TorchHarness:
 
         import torch
 
+        # TF32 matmuls on Tensor-Core GPUs (L4/A100): a throughput win under the fixed
+        # compute budget at negligible precision cost; harmless no-op on CPU/other GPUs.
+        torch.set_float32_matmul_precision("high")
+
         from vocdenoiser.denoise.config import Config
         from vocdenoiser.denoise.train import build_dataloaders
         from vocdenoiser.search.metric import spectrogram_si_sdr
