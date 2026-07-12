@@ -125,7 +125,13 @@ class BetaVAE(L.LightningModule):
         return total
 
     def training_step(self, batch, _batch_idx):  # noqa: D102
-        return self._step(batch, "train")
+        loss = self._step(batch, "train")
+        # A single degenerate/NaN batch must not poison the weights: gradient
+        # clipping caps magnitude but does NOT sanitize a NaN, so skip the optimizer
+        # step (return None) whenever the loss is non-finite.
+        if not torch.isfinite(loss):
+            return None
+        return loss
 
     def validation_step(self, batch, _batch_idx):  # noqa: D102
         return self._step(batch, "val")
