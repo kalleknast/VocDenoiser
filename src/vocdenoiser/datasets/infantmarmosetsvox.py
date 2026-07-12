@@ -414,15 +414,28 @@ def download_imv(
     twins: tuple[int, ...] = ALL_TWINS,
     keep_archives: bool = False,
 ) -> None:
-    """Fetch + extract the InfantMarmosetsVox twin tarballs from Zenodo (~21 GB).
+    """Fetch + extract the InfantMarmosetsVox audio + annotations from Zenodo (~21 GB).
 
-    Each tarball is downloaded to ``<imv_root>/_downloads`` (curl resumes a partial
-    file), extracted, then deleted unless ``keep_archives``. Finally the layout is
-    normalized so audio lands at ``<imv_root>/data/twin_*/``.
+    First pulls the small documentation archive (holds ``labels.csv`` — the
+    annotations are *not* in the audio tarballs), then each twin tarball. Every
+    archive is downloaded to ``<imv_root>/_downloads``, extracted, then deleted
+    unless ``keep_archives``. Finally the layout is normalized so audio lands at
+    ``<imv_root>/data/twin_*/`` and ``labels.csv`` at ``<imv_root>/labels.csv``.
     """
     imv_root = Path(imv_root)
     dl_dir = imv_root / "_downloads"
     dl_dir.mkdir(parents=True, exist_ok=True)
+    # The annotations (labels.csv) ship in a separate ~2 MB documentation archive,
+    # NOT inside the audio tarballs. Fetch + extract it once; _normalize_layout then
+    # surfaces its labels.csv to <imv_root>/labels.csv. Skipped on re-runs once that
+    # file exists (so an interrupted prepare doesn't re-download it).
+    if not (imv_root / "labels.csv").exists():
+        doc = "InfantMarmosetsVox_documentation.tar.gz"
+        doc_dest = dl_dir / doc
+        _fetch(f"{IMV_ZENODO_BASE}/{doc}?download=1", doc_dest)
+        _extract_tarball(doc_dest, imv_root)
+        if not keep_archives:
+            doc_dest.unlink(missing_ok=True)
     for t in twins:
         if _twin_extracted(imv_root, t):
             print(f"  twin_{t} already extracted — skipping download.")
