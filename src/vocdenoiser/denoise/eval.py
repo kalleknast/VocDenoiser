@@ -164,6 +164,25 @@ def main(argv: list[str] | None = None) -> None:
     cfg = Config.from_args(args)
 
     latents, files = extract_latents(cfg, args.ckpt)
+
+    # Drop any non-finite latents so a single bad row can't NaN out UMAP/RF. A few
+    # usually means a degenerate clean clip; most/all of them means the checkpoint
+    # itself diverged (NaN weights) — pick an earlier ckpt (e.g. the best
+    # betavae-05-*.ckpt) or retrain.
+    finite = np.isfinite(latents).all(axis=1)
+    n_bad = int((~finite).sum())
+    if n_bad:
+        print(
+            f"WARNING: {n_bad}/{latents.shape[0]} latents are non-finite (NaN/inf) — dropping them."
+        )
+        latents = latents[finite]
+        files = [f for f, ok in zip(files, finite) if ok]
+    if latents.shape[0] == 0:
+        raise SystemExit(
+            "All latents are non-finite: the checkpoint has NaN/inf weights and is unusable. "
+            "Use an earlier checkpoint or retrain."
+        )
+
     np.save(args.out_latents, latents)
     print(f"Extracted {latents.shape[0]} latents of dim {latents.shape[1]} -> {args.out_latents}")
 
