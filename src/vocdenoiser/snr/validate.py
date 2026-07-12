@@ -22,7 +22,13 @@ from pathlib import Path
 
 import numpy as np
 
-from vocdenoiser.audio import read_wav, read_wav_segment, wav_num_frames
+from vocdenoiser.audio import (
+    read_wav,
+    read_wav_segment,
+    resample_linear,
+    wav_meta,
+    wav_num_frames,
+)
 from vocdenoiser.snr.metric import DEFAULT_PARAMS, SNRParams, clip_features
 
 
@@ -62,6 +68,154 @@ def _noise_segment(path: str, length: int, rng: np.random.RandomState) -> np.nda
     start = rng.randint(0, total - length + 1)
     seg, _ = read_wav_segment(path, start, length)
     return seg
+
+
+def _noise_segment_ratematched(
+    path: str, call_len: int, call_sr: int, rng: np.random.RandomState
+) -> np.ndarray:
+    """A ``call_len``-sample noise slice matched to the call's sample rate.
+
+    The colony-noise recordings are 96 kHz but the labeled call sets can be 44.1
+    kHz; we read enough noise to cover the call's *duration* at the noise rate,
+    then resample to the call's rate so the mix is physically consistent.
+    """
+    noise_sr, total = wav_meta(path)
+    want = int(np.ceil(call_len * noise_sr / call_sr))
+    if total < want:
+        y, _ = read_wav(path)
+        reps = int(np.ceil(want / max(len(y), 1)))
+        seg = np.tile(y, reps)[:want]
+    else:
+        start = rng.randint(0, total - want + 1)
+        seg, _ = read_wav_segment(path, start, want)
+    return resample_linear(seg, call_len)
+
+
+def _discover_labeled(labeled_dir) -> dict[str, list[Path]]:
+    """Map subfolder name (the class/type label) -> list of WAVs under it."""
+    root = Path(labeled_dir)
+    out: dict[str, list[Path]] = {}
+    for sub in sorted(p for p in root.iterdir() if p.is_dir()):
+        wavs = sorted(w for w in sub.rglob("*") if w.suffix.lower() == ".wav")
+        if wavs:
+            out[sub.name] = wavs
+    return out
+
+
+def run_validation_labeled(
+    labeled_dir,
+    noise_dirs: list[str | Path],
+    out_dir: str | Path,
+    snr_levels=(-5, 0, 5, 10, 15, 20),
+    params: SNRParams = DEFAULT_PARAMS,
+    seed: int = 0,
+    phee_prefix: str = "phee",
+) -> str:
+    """Ground-truth call-type bias check using a folder-per-type labeled set.
+
+    Two views:
+      1. **Clean SNR per type** — the distribution of the score within each call
+         type (confounded by per-type recording differences, so descriptive).
+      2. **Controlled injection per type** — mix real background noise into every
+         clip at a known SNR sweep and confirm the measured score tracks injected
+         SNR *the same way across types*. This is the definitive bias test: if the
+         metric favored phee morphology, phee types would sit systematically above
+         the non-phee types at each injected level.
+    """
+    from collections import defaultdict
+
+    groups = _discover_labeled(labeled_dir)
+    if not groups:
+        raise FileNotFoundError(f"No type subfolders with WAVs under {labeled_dir}")
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.RandomState(seed)
+
+    noise_paths = []
+    for nd in noise_dirs:
+        noise_paths += [str(p) for p in Path(nd).rglob("*") if p.suffix.lower() == ".wav"]
+    if not noise_paths:
+        raise FileNotFoundError(f"No noise WAVs under {noise_dirs}")
+
+    clean: dict[str, list[float]] = defaultdict(list)
+    inj: dict[str, dict[float, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for label, files in groups.items():
+        for f in files:
+            y, sr = read_wav(str(f))
+            if len(y) < params.n_fft:
+                continue
+            clean[label].append(clip_features(y, sr, params)["snr_db"])
+            noise = _noise_segment_ratematched(
+                noise_paths[rng.randint(len(noise_paths))], len(y), sr, rng
+            )
+            for lvl in snr_levels:
+                mixed = _mix_at_snr(y, noise, float(lvl))
+                inj[label][lvl].append(clip_features(mixed, sr, params)["snr_db"])
+
+    labels = sorted(groups)
+    # clean medians
+    clean_med = {lab: float(np.median(clean[lab])) for lab in labels if clean[lab]}
+    phee = [lab for lab in labels if lab.lower().startswith(phee_prefix)]
+    nonphee = [lab for lab in labels if lab not in phee]
+
+    # injection: per-type mean curve + cross-type spread per level
+    curves = {lab: [float(np.mean(inj[lab][lvl])) for lvl in snr_levels] for lab in labels}
+    spreads = []
+    for j in range(len(snr_levels)):
+        vals = [curves[lab][j] for lab in labels if not np.isnan(curves[lab][j])]
+        spreads.append(max(vals) - min(vals))
+    max_spread = float(max(spreads))
+    injected_range = max(snr_levels) - min(snr_levels)
+    spread_tol = 0.20 * injected_range
+
+    # is phee favored? compare mean injection response of phee vs non-phee types
+    phee_curve = np.mean([curves[l] for l in phee], axis=0) if phee else None
+    nonphee_curve = np.mean([curves[l] for l in nonphee], axis=0) if nonphee else None
+    phee_gap = (
+        float(np.mean(phee_curve - nonphee_curve))
+        if phee_curve is not None and nonphee_curve is not None
+        else float("nan")
+    )
+
+    spread_ok = max_spread < spread_tol
+    phee_ok = np.isnan(phee_gap) or abs(phee_gap) < 2.0
+    verdict = "PASS" if (spread_ok and phee_ok) else "REVIEW"
+
+    lines = ["# SNR call-agnosticism — ground-truth call-type validation\n"]
+    lines.append(f"**Verdict: {verdict}**\n")
+    lines.append(
+        f"Labeled set: {sum(len(v) for v in groups.values())} clips across "
+        f"{len(groups)} types ({', '.join(labels)}).\n"
+    )
+    lines.append("## Controlled injection response per call type (the bias test)\n")
+    lines.append(
+        f"- max cross-type spread of the mean response: **{max_spread:.2f} dB** "
+        f"(tolerance {spread_tol:.1f} dB = 20% of the {injected_range:.0f} dB sweep) "
+        f"{'✅' if spread_ok else '⚠️'}"
+    )
+    lines.append(
+        f"- phee vs non-phee mean response gap: **{phee_gap:+.2f} dB** "
+        f"({'phee favored' if phee_gap > 0 else 'phee not favored'}; "
+        f"want |gap| < 2 dB) {'✅' if phee_ok else '⚠️'}\n"
+    )
+    header = "| call type | " + " | ".join(f"{l}dB" for l in snr_levels) + " | clean median |"
+    lines.append(header)
+    lines.append("|" + "---|" * (len(snr_levels) + 2))
+    for lab in labels:
+        cells = " | ".join(f"{v:.1f}" for v in curves[lab])
+        cm = clean_med.get(lab, float("nan"))
+        star = " *(phee)*" if lab in phee else ""
+        lines.append(f"| {lab}{star} | {cells} | {cm:.1f} |")
+    lines.append(
+        "\nRows that overlap at each injected level = the metric responds to noise the "
+        "same way for phees and non-phees. A phee row sitting systematically above the "
+        "trill / twitter / tsik / ek rows would be the bias we must avoid.\n"
+    )
+    report = out_dir / "snr_validation_by_type.md"
+    report.write_text("\n".join(lines))
+    print(f"Call-type validation verdict: {verdict} (spread {max_spread:.2f} dB, "
+          f"phee gap {phee_gap:+.2f} dB). Wrote {report}")
+    return str(report)
 
 
 def _load_scan(csv_path: str | Path) -> list[dict]:

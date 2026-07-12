@@ -65,6 +65,17 @@ def cmd_validate(args) -> None:
     )
 
 
+def cmd_validate_types(args) -> None:
+    from vocdenoiser.snr.validate import run_validation_labeled
+
+    run_validation_labeled(
+        args.labeled_dir,
+        noise_dirs=args.noise_dir,
+        out_dir=args.out_dir,
+        params=_snr_params(args),
+    )
+
+
 def cmd_search_run(args) -> None:
     from vocdenoiser.search.ledger import Ledger
     from vocdenoiser.search.loop import SearchConfig, run_search
@@ -142,6 +153,17 @@ def build_parser() -> argparse.ArgumentParser:
     pv.add_argument("--n-clean", type=int, default=120)
     _add_stft_args(pv)
     pv.set_defaults(func=cmd_validate)
+
+    pt = snr_sub.add_parser(
+        "validate-types",
+        help="ground-truth call-type bias check (folder-per-type labeled set)",
+    )
+    pt.add_argument("labeled_dir", help="dir with one subfolder per call type")
+    pt.add_argument("--noise-dir", action="append", required=True,
+                    help="noise folder (repeatable)")
+    pt.add_argument("--out-dir", default="reports")
+    _add_stft_args(pt)
+    pt.set_defaults(func=cmd_validate_types)
 
     search = sub.add_parser("search", help="architecture search")
     search_sub = search.add_subparsers(dest="cmd", required=True)

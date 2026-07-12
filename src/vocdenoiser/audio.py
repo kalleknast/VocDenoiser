@@ -86,6 +86,26 @@ def wav_num_frames(path: str | Path) -> int:
         return w.getnframes()
 
 
+def wav_meta(path: str | Path) -> tuple[int, int]:
+    """(sample_rate, n_frames) from the WAV header — metadata only, no sample read."""
+    with wave.open(str(path), "rb") as w:
+        return w.getframerate(), w.getnframes()
+
+
+def resample_linear(y: np.ndarray, target_len: int) -> np.ndarray:
+    """Resample ``y`` to ``target_len`` samples by linear interpolation.
+
+    Crude but dependency-free (numpy only). Adequate for rate-matching a broadband
+    noise segment to a call's sample rate before mixing — we never need audio-grade
+    resampling of the calls themselves here.
+    """
+    if len(y) == target_len or len(y) < 2:
+        return y[:target_len] if len(y) >= target_len else np.pad(y, (0, target_len - len(y)))
+    src = np.linspace(0.0, 1.0, len(y))
+    dst = np.linspace(0.0, 1.0, target_len)
+    return np.interp(dst, src, y).astype(np.float32)
+
+
 def hann_window(n: int) -> np.ndarray:
     """Periodic Hann window (matches librosa/scipy 'hann' with sym=False)."""
     return 0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n) / n)
