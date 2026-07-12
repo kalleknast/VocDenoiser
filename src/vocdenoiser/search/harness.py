@@ -149,6 +149,13 @@ class TorchHarness:
                 if torch.cuda.is_available():
                     peak_vram = torch.cuda.max_memory_allocated() / 1e6
             except Exception as exc:  # noqa: BLE001 - a crashed candidate is logged, not fatal
+                # Surface WHY it crashed — otherwise a systematic bug (e.g. a shape
+                # mismatch hitting a whole family of candidates) is invisible behind a
+                # silent -inf. The search itself continues; this candidate is discarded.
+                import traceback
+
+                print(f"  candidate {c.id} crashed (seed {seed}): {type(exc).__name__}: {exc}")
+                traceback.print_exc()
                 return EvalResult(
                     metric=float("-inf"), status="crash", seeds=list(seeds),
                     num_params=nparams, train_seconds=time.time() - t0,

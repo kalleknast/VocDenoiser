@@ -85,9 +85,13 @@ def run_search(
         ledger.append(rec)
         done += 1
         best = ledger.best()
+        # best is None until something is kept: a candidate that crashes/discards on
+        # iteration 1 leaves the frontier empty, so guard the incumbent readout rather
+        # than dereferencing None (which would abort the whole search on one bad candidate).
+        best_str = f"{best.metric:+.3f} ({best.id})" if best is not None else "n/a"
         log(
             f"[{done:3d}/{cfg.iters}] {cand.origin:9s} metric={res.metric:+.3f}"
-            f"±{res.metric_std:.2f} -> {status:7s}  best={best.metric:+.3f} ({best.id})"
+            f"±{res.metric_std:.2f} -> {status:7s}  best={best_str}"
         )
 
     return ledger.best()

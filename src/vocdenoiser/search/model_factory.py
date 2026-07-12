@@ -49,7 +49,11 @@ class ConfigurableBetaVAE(L.LightningModule):
                 f"2**n_conv_layers ({ds}) for candidate {cand.id}"
             )
         chans = [1] + [int(round(cand.base_channels * cand.channel_mult**i)) for i in range(n)]
-        pad = cand.kernel_size // 2
+        # 'same'-style stride-2 padding. (k-1)//2 halves the input for BOTH odd and
+        # even kernels; k//2 would over-pad even kernels (k=4 -> 256 becomes 129, not
+        # 128) so the flattened encoder output no longer matches fc_mu's _flat and the
+        # first forward dies with a matmul shape error.
+        pad = (cand.kernel_size - 1) // 2
         act = _ACT[cand.act]
 
         enc: list[nn.Module] = []
@@ -77,7 +81,7 @@ class ConfigurableBetaVAE(L.LightningModule):
             dec.append(
                 nn.ConvTranspose2d(
                     chans[i], out_ch, cand.kernel_size, stride=2, padding=pad,
-                    output_padding=1,
+                    output_padding=cand.kernel_size % 2,  # 1 for odd k, 0 for even: exact 2x upsample
                 )
             )
             if i > 1:
