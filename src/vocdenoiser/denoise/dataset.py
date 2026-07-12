@@ -51,7 +51,7 @@ class PheeDenoiseDataset(Dataset):
         files: list[Path],
         *,
         epoch: int = 0,
-        babble_pool_size: int = 12,
+        babble_pool_size: int = 128,
     ) -> None:
         import torchaudio
 
@@ -82,6 +82,28 @@ class PheeDenoiseDataset(Dataset):
                     f"under {dirs} — falling back to synthetic noise only. Point --noise-dirs "
                     "at the recorded colony noise (e.g. /content/Noise /content/Cigarra)."
                 )
+
+        # Babble pool cached ONCE (not re-loaded per item): loading ~12 calls off
+        # disk on every __getitem__ was the training bottleneck. babble() samples
+        # 5–10 of these per item with random attenuation/offset for diversity.
+        self._babble_cache: list[torch.Tensor] = []
+        if cfg.augment:
+            self._babble_cache = self._build_babble_cache()
+
+    def _build_babble_cache(self) -> list[torch.Tensor]:
+        """Load a fixed pool of clean calls once, for the babble noise component."""
+        if not self.files:
+            return []
+        n = min(self.babble_pool_size, len(self.files))
+        g = torch.Generator().manual_seed(self.cfg.seed + 777)
+        idxs = torch.randperm(len(self.files), generator=g)[:n].tolist()
+        cache: list[torch.Tensor] = []
+        for j in idxs:
+            try:
+                cache.append(self._load(self.files[j]))
+            except Exception:  # noqa: BLE001 - a bad file must not kill training
+                continue
+        return cache
 
     def __len__(self) -> int:
         return len(self.files)
@@ -159,19 +181,6 @@ class PheeDenoiseDataset(Dataset):
         wav = torch.from_numpy(np.ascontiguousarray(seg, dtype=np.float32))
         return augment._fit_length(wav, n)
 
-    def _babble_pool(self, index: int, generator: torch.Generator) -> list[torch.Tensor]:
-        pool: list[torch.Tensor] = []
-        n = min(self.babble_pool_size, len(self.files))
-        for _ in range(n):
-            j = augment._randint(0, len(self.files) - 1, generator)
-            if j == index:
-                continue
-            try:
-                pool.append(self._load(self.files[j]))
-            except Exception:  # noqa: BLE001 - a bad file must not kill a batch
-                continue
-        return pool
-
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         cfg = self.cfg
         g = self._generator(index)
@@ -189,9 +198,8 @@ class PheeDenoiseDataset(Dataset):
         if not cfg.augment:
             return clean_spec, clean_spec  # clean→clean for eval / latent extraction
 
-        pool = self._babble_pool(index, g)
         real_bg = self._real_background(call.numel(), g)
-        bed = augment.noise_bed(call.numel(), pool, cfg, g, real_bg=real_bg)
+        bed = augment.noise_bed(call.numel(), self._babble_cache, cfg, g, real_bg=real_bg)
         snr_db = augment._uniform(cfg.snr_db_min, cfg.snr_db_max, g)
         noisy = augment.mix_at_snr(call, bed, snr_db)
         noisy_spec = self._log_mel(noisy)

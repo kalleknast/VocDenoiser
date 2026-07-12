@@ -34,7 +34,12 @@ def build_dataloaders(cfg: Config):
     train_ds = PheeDenoiseDataset(cfg, train_files)
     val_ds = PheeDenoiseDataset(cfg, val_files)  # noise kept on in val too
 
-    common = dict(batch_size=cfg.batch_size, num_workers=cfg.num_workers, pin_memory=True)
+    common = dict(
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        persistent_workers=cfg.num_workers > 0,  # keep workers (+ babble cache) across epochs
+    )
     train_dl = DataLoader(train_ds, shuffle=True, drop_last=True, **common)
     val_dl = DataLoader(val_ds, shuffle=False, **common)
     return train_ds, train_dl, val_dl
