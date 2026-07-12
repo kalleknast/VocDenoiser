@@ -92,6 +92,8 @@ def cmd_search_run(args) -> None:
         overrides = {}
         if args.data_root:
             overrides["data_root"] = args.data_root
+        if args.noise_dirs:
+            overrides["noise_dirs"] = tuple(args.noise_dirs)
         harness = TorchHarness(base_config_overrides=overrides, max_steps=args.max_steps)
 
     ledger = Ledger(args.ledger)
@@ -182,6 +184,9 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument("--seed", type=int, default=0)
     sr.add_argument("--max-steps", type=int, default=400, help="torch harness compute budget")
     sr.add_argument("--data-root", default=None, help="clean-call root (torch harness)")
+    sr.add_argument("--noise-dirs", nargs="+", default=None,
+                    help="real colony-noise dirs for the torch harness (e.g. /content/Noise "
+                         "/content/Cigarra); omit for synthetic noise only")
     sr.set_defaults(func=cmd_search_run)
 
     srep = search_sub.add_parser("report", help="summarise a search ledger")
