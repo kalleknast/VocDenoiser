@@ -47,6 +47,7 @@ def cmd_select(args) -> None:
         args.out,
         snr_threshold=args.threshold,
         keep_percentile=args.keep_percentile,
+        broadband_floor=args.broadband_floor,
         exclude_multi_source=not args.keep_multi_source,
         link_dir=args.link_dir,
     )
@@ -139,6 +140,8 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--out", required=True, help="output manifest CSV")
     pl.add_argument("--threshold", type=float, default=None, help="absolute snr_db cutoff")
     pl.add_argument("--keep-percentile", type=float, default=None, help="keep top X%%")
+    pl.add_argument("--broadband-floor", type=float, default=None,
+                    help="also drop clips with snr_broadband_db below this dB")
     pl.add_argument("--keep-multi-source", action="store_true",
                     help="do NOT drop clips flagged with >1 active segment")
     pl.add_argument("--link-dir", default=None, help="symlink selected clips here")

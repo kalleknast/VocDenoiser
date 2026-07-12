@@ -9,12 +9,19 @@
 Latents are the encoder means ``mu`` of *clean* calls (augmentation off), i.e.
 the deterministic embedding used downstream for clustering.
 
-    python -m vocdenoiser.denoise.eval --data-root /path/to/clean_calls \
-        --ckpt checkpoints/last.ckpt --label-from parent
+    python -m vocdenoiser.denoise.eval --ckpt checkpoints/last.ckpt \
+        --labels-csv individuals.csv
 
-Identity labels are derived from each file's path via ``--label-from``:
-``parent`` (immediate folder name), ``stem`` (filename), or ``prefix`` (text
-before the first ``--label-sep``, default ``_``).
+Individual-identity labels for the RandomForest proxy come from one of:
+  * ``--labels-csv`` — a CSV mapping call ID → individual (columns default to
+    ``id,identity``; the ID is matched against each WAV's stem or filename). This
+    is the path for ``data/Vocalizations``, whose files are bare numeric call IDs
+    with no identity in the filename.
+  * ``--label-from`` — derive from the path when identity *is* encoded there:
+    ``parent`` (folder), ``stem`` (filename), or ``prefix`` (text before the first
+    ``--label-sep``, default ``_``).
+
+With no labels, the UMAP scatter still renders; the RandomForest proxy is skipped.
 """
 
 from __future__ import annotations
@@ -35,6 +42,32 @@ def _label_for(path: Path, scheme: str, sep: str) -> str:
     if scheme == "prefix":
         return path.stem.split(sep)[0]
     raise ValueError(f"Unknown --label-from scheme: {scheme!r}")
+
+
+def _load_label_map(csv_path: str, key_col: str, val_col: str) -> dict[str, str]:
+    """Read a CSV into a ``{call-id: identity}`` dict for the RF identity proxy."""
+    import csv
+
+    with open(csv_path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        if reader.fieldnames is None or key_col not in reader.fieldnames:
+            raise ValueError(
+                f"{csv_path} needs a header with a '{key_col}' column "
+                f"(got {reader.fieldnames}). Set --labels-key-col / --labels-value-col."
+            )
+        return {row[key_col]: row[val_col] for row in reader}
+
+
+def _resolve_labels(files: list[Path], args) -> list[str | None]:
+    """Per-file identity label (None where unknown), from CSV or the path scheme."""
+    if args.labels_csv:
+        lmap = _load_label_map(args.labels_csv, args.labels_key_col, args.labels_value_col)
+        labels = [lmap.get(p.stem, lmap.get(p.name)) for p in files]
+        n_missing = sum(label is None for label in labels)
+        if n_missing:
+            print(f"{n_missing}/{len(files)} calls had no entry in {args.labels_csv}.")
+        return labels
+    return [_label_for(p, args.label_from, args.label_sep) for p in files]
 
 
 def extract_latents(cfg: Config, ckpt_path: str) -> tuple[np.ndarray, list[Path]]:
@@ -112,6 +145,9 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Evaluate β-VAE latents.")
     Config.add_cli_args(parser)
     parser.add_argument("--ckpt", required=True, help="path to a trained .ckpt")
+    parser.add_argument("--labels-csv", help="CSV mapping call id -> individual identity")
+    parser.add_argument("--labels-key-col", default="id", help="CSV id column (matches WAV stem)")
+    parser.add_argument("--labels-value-col", default="identity", help="CSV identity column")
     parser.add_argument("--label-from", default="parent", choices=["parent", "stem", "prefix"])
     parser.add_argument("--label-sep", default="_")
     parser.add_argument("--out-png", default="umap_latents.png")
@@ -120,12 +156,20 @@ def main(argv: list[str] | None = None) -> None:
     cfg = Config.from_args(args)
 
     latents, files = extract_latents(cfg, args.ckpt)
-    labels = [_label_for(p, args.label_from, args.label_sep) for p in files]
     np.save(args.out_latents, latents)
     print(f"Extracted {latents.shape[0]} latents of dim {latents.shape[1]} -> {args.out_latents}")
 
-    run_umap(latents, labels, args.out_png, cfg.seed)
-    identity_rf(latents, labels, cfg.seed)
+    labels = _resolve_labels(files, args)
+    run_umap(latents, [label or "unlabeled" for label in labels], args.out_png, cfg.seed)
+
+    keep = [i for i, label in enumerate(labels) if label is not None]
+    if len(keep) >= 2 and len({labels[i] for i in keep}) >= 2:
+        identity_rf(latents[keep], [labels[i] for i in keep], cfg.seed)
+    else:
+        print(
+            "No usable identity labels — skipping the RandomForest proxy. "
+            "Pass --labels-csv (id,identity) to enable it."
+        )
 
 
 if __name__ == "__main__":

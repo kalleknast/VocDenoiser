@@ -1,12 +1,15 @@
 """Tests for the call-agnostic SNR pipeline (numpy-only; no torch needed)."""
 
+import csv
 import wave
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from vocdenoiser.audio import read_wav, read_wav_segment
 from vocdenoiser.snr.metric import DEFAULT_PARAMS, clip_features, spectral_snr_db
+from vocdenoiser.snr.select import select_clean
 from vocdenoiser.snr.threshold import fit_gmm_1d, otsu_threshold
 from vocdenoiser.snr.validate import spearman
 from vocdenoiser.audio import power_spectrogram
@@ -86,3 +89,76 @@ def test_spearman_signs():
     x = np.arange(100.0)
     assert spearman(x, x) > 0.99
     assert spearman(x, -x) < -0.99
+
+
+def _write_scan_csv(path, rows, *, with_broadband=True):
+    """rows: list of (filename, snr_db, snr_broadband_db, n_segments)."""
+    fields = ["filename", "snr_db", "n_segments"]
+    if with_broadband:
+        fields.insert(2, "snr_broadband_db")
+    with open(path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=fields)
+        w.writeheader()
+        for fn, snr, bb, nseg in rows:
+            row = {"filename": fn, "snr_db": snr, "n_segments": nseg}
+            if with_broadband:
+                row["snr_broadband_db"] = bb
+            w.writerow(row)
+
+
+def _manifest_names(path):
+    with open(path, newline="") as fh:
+        return {r["filename"] for r in csv.DictReader(fh)}
+
+
+def test_broadband_floor_drops_hissy_narrowband(tmp_path: Path):
+    """A clip that clears the snr_db cutoff but is hissy (low broadband) is dropped."""
+    csv_path = tmp_path / "scan.csv"
+    _write_scan_csv(csv_path, [
+        ("clean.wav", 25.0, 22.0, 1),    # high on both -> keep
+        ("hissy.wav", 24.0, 6.0, 1),     # high snr_db but low broadband -> drop by floor
+        ("noisy.wav", 10.0, 9.0, 1),     # below snr_db cutoff -> drop by threshold
+    ])
+    out = tmp_path / "manifest.csv"
+
+    # Without a floor, the hissy narrowband clip survives the snr_db cutoff.
+    s = select_clean(csv_path, tmp_path, out, snr_threshold=20.0)
+    assert _manifest_names(out) == {"clean.wav", "hissy.wav"}
+    assert s["n_dropped_broadband"] == 0
+
+    # With a broadband floor, the hissy clip is removed.
+    s = select_clean(csv_path, tmp_path, out, snr_threshold=20.0, broadband_floor=15.0)
+    assert _manifest_names(out) == {"clean.wav"}
+    assert s["n_dropped_broadband"] == 1
+    assert s["broadband_floor_db"] == 15.0
+
+
+def test_broadband_floor_manifest_has_column(tmp_path: Path):
+    csv_path = tmp_path / "scan.csv"
+    _write_scan_csv(csv_path, [("a.wav", 25.0, 22.0, 1)])
+    out = tmp_path / "manifest.csv"
+    select_clean(csv_path, tmp_path, out, snr_threshold=20.0)
+    with open(out, newline="") as fh:
+        header = next(csv.reader(fh))
+    assert "snr_broadband_db" in header
+
+
+def test_broadband_floor_errors_without_column(tmp_path: Path):
+    csv_path = tmp_path / "scan.csv"
+    _write_scan_csv(csv_path, [("a.wav", 25.0, None, 1)], with_broadband=False)
+    out = tmp_path / "manifest.csv"
+    with pytest.raises(ValueError, match="snr_broadband_db"):
+        select_clean(csv_path, tmp_path, out, snr_threshold=20.0, broadband_floor=15.0)
+
+
+def test_broadband_floor_drops_missing_value_rows(tmp_path: Path):
+    """A row whose broadband cell is blank fails the floor (conservative)."""
+    csv_path = tmp_path / "scan.csv"
+    _write_scan_csv(csv_path, [
+        ("ok.wav", 25.0, 20.0, 1),
+        ("blank.wav", 25.0, "", 1),
+    ])
+    out = tmp_path / "manifest.csv"
+    s = select_clean(csv_path, tmp_path, out, snr_threshold=20.0, broadband_floor=10.0)
+    assert _manifest_names(out) == {"ok.wav"}
+    assert s["n_dropped_broadband"] == 1

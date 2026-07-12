@@ -1,7 +1,7 @@
 # VocDenoiser
 
 Denoising **and** compression of common-marmoset (*Callithrix jacchus*) vocalizations —
-targeting isolated **phee** calls. Two stages:
+targeting isolated **phee** calls. Three stages:
 
 1. **SNR filtering** (`vocdenoiser.snr`) — a call-agnostic, numpy-only pipeline that scores
    clips by the **mean per-bin SNR over active bins** (an intensive, band-free measure that
@@ -34,15 +34,23 @@ pip install -e .
 
 ## Data
 
-- The **clean phee-call training set is off-repo** (see `CLAUDE.local.md`); this repo ships
-  only colony **noise** (`data/Noise/`, used for augmentation/validation, *not* as calls).
-- Source audio is **96 kHz mono 16-bit PCM**. `resample_sr` in the config resamples before the
-  STFT if you want a lower rate.
-- **Copy the clean set to local disk before training.** The repo lives on a slow pCloud FUSE
-  mount; the data loader reads WAVs per item and must not stream them off that mount.
+All audio ships in the repo under `data/` (gitignored — local only):
 
-The clean-call root is **never hardcoded** — pass `--data-root` or set
-`VOCDENOISER_DATA_ROOT`, so the same commands run on Colab and locally.
+- `data/Vocalizations/` — **~50,000 isolated phee calls** (96 kHz mono 16-bit PCM, ~0.5 s each),
+  named by bare numeric call ID (`100000.wav`). The clean-call training set and default
+  `data_root`.
+- `data/Noise/` — 30 one-minute colony-noise clips (real-noise augmentation / SNR validation).
+- `data/Cigarra/` — 136 cicada-noise clips (second noise source for SNR `validate`).
+
+`resample_sr` in the config resamples before the STFT if you want a rate below 96 kHz.
+
+The clean-call root is **never hardcoded** — it resolves as `--data-root` >
+`$VOCDENOISER_DATA_ROOT` > `data/Vocalizations` (default), so the same commands run on Colab and
+locally. The 50k calls are the isolated-call *pool*; run the SNR filtering below first to train
+only on the selected clean subset.
+
+**Copy the calls to local disk before training.** `data/` sits on a slow pCloud FUSE mount and
+the loader reads WAVs per item — don't stream them off the mount in the training loop.
 
 ## SNR filtering — select the clean training set
 
@@ -60,9 +68,10 @@ python -m vocdenoiser.cli snr report artifacts/snr_scores.csv --out-dir reports
 python -m vocdenoiser.cli snr validate artifacts/snr_scores.csv --src-dir data/Vocalizations \
     --noise-dir data/Noise --noise-dir data/Cigarra --out-dir reports
 
-# 4. apply a threshold (or --keep-percentile N) -> clean manifest (+ optional --link-dir)
+# 4. apply a threshold (or --keep-percentile N) -> clean manifest (+ optional --link-dir).
+#    --broadband-floor adds a secondary snr_broadband_db cutoff to drop hissy narrowband clips.
 python -m vocdenoiser.cli snr select artifacts/snr_scores.csv --src-dir data/Vocalizations \
-    --out artifacts/clean_manifest.csv --threshold 19.8 --link-dir clean_subset
+    --out artifacts/clean_manifest.csv --threshold 19.82 --broadband-floor 15 --link-dir clean_subset
 ```
 
 **How the score works.** Per frequency bin, the noise floor is a temporal low-percentile and
@@ -70,9 +79,10 @@ the signal a high-percentile; the score is the *mean of the per-bin SNR over the
 Because it is intensive (a per-bin average, not an energy sum) it does not reward broadband
 calls, and because the floor is per-bin it makes no assumption about which band a call occupies
 — so trills / twitters / eks are scored on equal footing with tonal phees. `snr_broadband_db`
-is a secondary, broadband-sensitive score (bandwidth-biased) for optionally flagging hissy
-clips. `n_segments>1` flags likely co-occurring sources (target call + an overlapping bird /
-word / transient), which `select` drops by default.
+is a secondary, broadband-sensitive score (bandwidth-biased); pass `--broadband-floor` to
+`select` to drop hissy narrowband clips the primary cutoff lets through. `n_segments>1` flags
+likely co-occurring sources (target call + an overlapping bird / word / transient), which
+`select` drops by default.
 
 **Validation.** `snr validate` runs the definitive check: it mixes real background noise
 (`data/Noise` + `data/Cigarra`) into clean calls at a known SNR sweep and confirms the score
@@ -96,15 +106,18 @@ Checkpoints are written to `--ckpt-dir` (default `checkpoints/`), best-3 by `val
 ## Evaluate (SPECS.md metrics)
 
 ```bash
-python -m vocdenoiser.denoise.eval \
-    --data-root "$VOCDENOISER_DATA_ROOT" \
-    --ckpt checkpoints/last.ckpt \
-    --label-from parent            # identity = each call's parent-folder name
+python -m vocdenoiser.denoise.eval --ckpt checkpoints/last.ckpt \
+    --labels-csv individuals.csv        # columns: id,identity  (id matches the WAV stem)
 ```
 
 Produces a **UMAP** scatter of the 16 latents (`umap_latents.png`), saves the raw latents
 (`latents.npy`), and reports a cross-validated **RandomForest** identity accuracy — the
 "is individual identity preserved under compression?" proxy.
+
+`data/Vocalizations` filenames are bare call IDs with no identity in the path, so the RF proxy
+needs `--labels-csv` (an ID→individual mapping). Without labels the UMAP still renders and the
+RF step is skipped. If your calls *do* encode identity in the path, use
+`--label-from parent|stem|prefix` instead.
 
 ## Architecture search (autoresearch-style)
 
