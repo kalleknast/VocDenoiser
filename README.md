@@ -119,6 +119,25 @@ needs `--labels-csv` (an ID→individual mapping). Without labels the UMAP still
 RF step is skipped. If your calls *do* encode identity in the path, use
 `--label-from parent|stem|prefix` instead.
 
+### External benchmark datasets (`vocdenoiser.datasets`)
+
+Two public, CC-BY-4.0 datasets can supply the labels the eval needs. Each loader cuts/decodes
+per-call WAV clips (resampled to `--target-sr`, default 96 kHz to match the model) and writes an
+`id,identity` CSV for `--labels-csv`:
+
+```bash
+# InfantMarmosetsVox — the only open set with per-call CALLER IDENTITY (10 individuals).
+# Cuts labels.csv segments from the 350 ten-minute recordings; identity = caller.
+python -m vocdenoiser.datasets.infantmarmosetsvox --target-sr 96000
+
+# MarmAudio — 96 kHz, ~215k clips labelled by CALL TYPE only (no caller identity).
+python -m vocdenoiser.datasets.marmaudio [--extract --target-sr 96000]
+```
+
+See `data/labelled/README.md` for provenance, licenses, and download steps. InfantMarmosetsVox
+is a *cross-dataset* benchmark (different colony, native 44.1 kHz), so read its RF accuracy as an
+external check, not an in-domain number.
+
 ## Architecture search (autoresearch-style)
 
 Inspired by Karpathy's [`autoresearch`](https://github.com/karpathy/autoresearch): a greedy
