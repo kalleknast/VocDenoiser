@@ -74,6 +74,11 @@ class Config:
     batch_size: int = 32
     lr: float = 1e-3
     max_epochs: int = 100
+    # Early stopping on val_loss: halt after this many epochs with no improvement
+    # (0 disables — train the full max_epochs). val_loss plateaus by ~epoch 5-10 on
+    # this data, so this typically saves most of the 100-epoch budget.
+    early_stop_patience: int = 15
+    early_stop_min_delta: float = 0.0  # min val_loss decrease that counts as improvement
     num_workers: int = 4
     val_frac: float = 0.1
     ckpt_dir: str = "checkpoints"

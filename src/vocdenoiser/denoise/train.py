@@ -47,7 +47,7 @@ def build_dataloaders(cfg: Config):
 
 def main(argv: list[str] | None = None) -> None:
     import lightning as L
-    from lightning.pytorch.callbacks import Callback, ModelCheckpoint
+    from lightning.pytorch.callbacks import Callback, EarlyStopping, ModelCheckpoint
 
     from vocdenoiser.denoise.beta_vae import BetaVAE
 
@@ -70,11 +70,23 @@ def main(argv: list[str] | None = None) -> None:
         save_top_k=3,
         save_last=True,
     )
+    callbacks: list[Callback] = [ckpt, _SetEpoch()]
+    if cfg.early_stop_patience > 0:
+        # Stop once val_loss stops improving; also halts on a non-finite val_loss
+        # (check_finite defaults True), complementing the training-step NaN skip.
+        callbacks.append(
+            EarlyStopping(
+                monitor="val_loss",
+                mode="min",
+                patience=cfg.early_stop_patience,
+                min_delta=cfg.early_stop_min_delta,
+            )
+        )
     trainer = L.Trainer(
         max_epochs=cfg.max_epochs,
         accelerator="auto",
         devices="auto",
-        callbacks=[ckpt, _SetEpoch()],
+        callbacks=callbacks,
         log_every_n_steps=10,
         gradient_clip_val=1.0,  # cap step size so a bad batch can't blow the VAE up to NaN
     )
