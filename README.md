@@ -135,8 +135,18 @@ python -m vocdenoiser.datasets.infantmarmosetsvox --download --target-sr 96000
 python -m vocdenoiser.datasets.marmaudio [--extract --target-sr 96000]
 ```
 
-See `data/labelled/README.md` for provenance, licenses, and download steps. InfantMarmosetsVox
-is a *cross-dataset* benchmark (different colony, native 44.1 kHz), so read its RF accuracy as an
+Each prepared clip is **quality-scored** (call-agnostic SNR + level + clipping) and the metrics
+are written into the label CSV; external corpora vary in recording quality, so pass thresholds to
+drop the bad clips before they bias the benchmark:
+
+```bash
+# drop noisy (< 6 dB), near-silent (peak < -40 dBFS), or over-recorded (>1% clipped) clips:
+python -m vocdenoiser.datasets.infantmarmosetsvox --min-snr 6 --min-peak-dbfs -40 --max-clip-frac 0.01
+```
+
+The run prints a quality distribution + concern counts (`--no-quality` skips scoring). See
+`data/labelled/README.md` for provenance, licenses, and download steps. InfantMarmosetsVox is a
+*cross-dataset* benchmark (different colony, native 44.1 kHz), so read its RF accuracy as an
 external check, not an in-domain number.
 
 ## Architecture search (autoresearch-style)

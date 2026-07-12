@@ -45,6 +45,13 @@ from pathlib import Path
 
 import numpy as np
 
+from vocdenoiser.datasets.quality import (
+    QUALITY_COLS,
+    clip_quality,
+    quality_fail_reasons,
+    summarize,
+)
+
 # Non-call-type labels in Annotations.tsv: 'Vocalization' = detected but untyped.
 DEFAULT_EXCLUDE = frozenset({"Vocalization", "Noise"})
 
@@ -96,15 +103,34 @@ def parse_annotations(
     return out
 
 
-def write_label_csv(clips: list[LabeledClip], out_csv: str | Path) -> None:
-    """Write the ``id,identity`` CSV. ``identity`` = call type (no caller id exists)."""
+def _fmt_quality(q: dict, col: str) -> str:
+    val = q.get(col, "")
+    return f"{val:.4f}" if isinstance(val, float) else str(val)
+
+
+def write_label_csv(
+    clips: list[LabeledClip],
+    out_csv: str | Path,
+    qualities: dict[str, dict] | None = None,
+) -> None:
+    """Write the ``id,identity(,quality…)`` CSV. ``identity`` = call type (no caller id exists).
+
+    If ``qualities`` (``uid -> quality dict``) is given, per-clip quality columns
+    are appended (only available when the audio was decoded via ``--extract``).
+    """
     out_csv = Path(out_csv)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
+    base = ["id", "identity", "call_type", "source_file", "source_recording"]
+    qcols = QUALITY_COLS if qualities else []
     with open(out_csv, "w", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["id", "identity", "call_type", "source_file", "source_recording"])
+        writer.writerow(base + qcols)
         for c in clips:
-            writer.writerow([c.uid, c.label, c.label, c.file_name, c.parent_name])
+            row = [c.uid, c.label, c.label, c.file_name, c.parent_name]
+            if qualities:
+                q = qualities.get(c.uid, {})
+                row += [_fmt_quality(q, col) for col in qcols]
+            writer.writerow(row)
 
 
 def _resample(sig: np.ndarray, sr: int, target_sr: int, _warned: list[bool]) -> np.ndarray:
@@ -138,11 +164,22 @@ def extract_clips(
     flac_dir: str | Path,
     out_dir: str | Path,
     target_sr: int = 96_000,
-) -> int:
+    quality: bool = True,
+    out_csv: str | Path | None = None,
+    min_snr: float | None = None,
+    min_active_frac: float | None = None,
+    max_clip_frac: float | None = None,
+    min_peak_dbfs: float | None = None,
+    min_dur: float | None = None,
+    max_segments: int | None = None,
+) -> list[LabeledClip]:
     """Decode the labelled FLAC clips to mono WAV at ``target_sr`` in ``out_dir``.
 
-    Needs ``soundfile`` (FLAC support). Missing source files are skipped. Returns
-    the number of clips written.
+    Needs ``soundfile`` (FLAC support). Missing source files are skipped. With
+    ``quality`` on, each decoded clip is scored and (if any ``min_*``/``max_*``
+    threshold is set) low-quality clips are dropped. When ``out_csv`` is given, an
+    ``id,identity`` CSV with quality columns is written for the kept clips.
+    Returns the list of kept clips.
     """
     try:
         import soundfile as sf
@@ -155,9 +192,20 @@ def extract_clips(
     flac_dir = Path(flac_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    thresholds = dict(min_snr=min_snr, min_active_frac=min_active_frac,
+                      max_clip_frac=max_clip_frac, min_peak_dbfs=min_peak_dbfs,
+                      min_dur=min_dur, max_segments=max_segments)
+    filtering = any(v is not None for v in thresholds.values())
+    score = quality or filtering
+
     warned: list[bool] = []
-    n_written = 0
+    kept: list[LabeledClip] = []
+    quals: dict[str, dict] = {}
+    scored: list[dict] = []
+    drop_reasons: dict[str, int] = {}
     n_missing = 0
+    n_dropped = 0
     for c in clips:
         src = flac_dir / c.file_name
         if not src.exists():
@@ -167,12 +215,31 @@ def extract_clips(
         sig = sig[:, 0]  # downmix to mono (first channel)
         out_sr = target_sr if target_sr > 0 else sr
         sig = _resample(sig, sr, out_sr, warned)
+        q = clip_quality(sig, out_sr) if score else None
+        if filtering:
+            reasons = quality_fail_reasons(q, **thresholds)
+            if reasons:
+                n_dropped += 1
+                for r in reasons:
+                    drop_reasons[r] = drop_reasons.get(r, 0) + 1
+                continue
         _write_wav(out_dir / f"{c.uid}.wav", sig, out_sr)
-        n_written += 1
-    print(f"Decoded {n_written}/{len(clips)} FLAC clips -> {out_dir}")
+        kept.append(c)
+        if q is not None:
+            quals[c.uid] = q
+            scored.append(q)
+
+    if out_csv is not None:
+        write_label_csv(kept, out_csv, quals or None)
+    print(f"Decoded {len(kept)}/{len(clips)} FLAC clips -> {out_dir}")
     if n_missing:
         print(f"  NOTE: {n_missing} FLAC files absent (partial download) — skipped.")
-    return n_written
+    if filtering:
+        reason_str = ", ".join(f"{k}={v}" for k, v in sorted(drop_reasons.items())) or "none"
+        print(f"  quality filter dropped {n_dropped} clips ({reason_str}).")
+    if scored:
+        print(summarize(scored))
+    return kept
 
 
 def _label_histogram(clips: list[LabeledClip]) -> dict[str, int]:
@@ -198,6 +265,19 @@ def main(argv: list[str] | None = None) -> None:
                    help="output dir for decoded WAV clips (for --extract)")
     p.add_argument("--target-sr", type=int, default=96_000,
                    help="resample decoded clips to this rate; 0 keeps native (for --extract)")
+    # Call-quality (only with --extract, since it needs the decoded audio):
+    p.add_argument("--no-quality", dest="quality", action="store_false",
+                   help="skip per-clip quality scoring during --extract")
+    p.add_argument("--min-snr", type=float, default=None, help="drop decoded clips with snr_db below this")
+    p.add_argument("--min-active-frac", type=float, default=None,
+                   help="drop decoded clips with active_frac below this")
+    p.add_argument("--max-clip-frac", type=float, default=None,
+                   help="drop decoded clips with more than this fraction of samples clipped")
+    p.add_argument("--min-peak-dbfs", type=float, default=None,
+                   help="drop decoded clips whose peak level is below this dBFS")
+    p.add_argument("--min-dur", type=float, default=None, help="drop decoded clips shorter than this many seconds")
+    p.add_argument("--max-segments", type=int, default=None,
+                   help="drop decoded clips with more than this many active segments")
     args = p.parse_args(argv)
 
     exclude = frozenset({"Noise"}) if args.keep_generic else DEFAULT_EXCLUDE
@@ -208,7 +288,13 @@ def main(argv: list[str] | None = None) -> None:
     print("  call-type distribution: " + ", ".join(f"{k}={v}" for k, v in hist.items()))
 
     if args.extract:
-        extract_clips(clips, args.flac_dir, args.extract_dir, target_sr=args.target_sr)
+        # The quality-scored, eval-ready CSV for the decoded subset lives with the clips.
+        extracted_csv = Path(args.extract_dir) / "marmaudio_labels.csv"
+        extract_clips(clips, args.flac_dir, args.extract_dir, target_sr=args.target_sr,
+                      quality=args.quality, out_csv=extracted_csv,
+                      min_snr=args.min_snr, min_active_frac=args.min_active_frac,
+                      max_clip_frac=args.max_clip_frac, min_peak_dbfs=args.min_peak_dbfs,
+                      min_dur=args.min_dur, max_segments=args.max_segments)
 
 
 if __name__ == "__main__":

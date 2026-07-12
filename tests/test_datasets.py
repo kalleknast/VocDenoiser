@@ -9,6 +9,7 @@ import pytest
 
 from vocdenoiser.datasets import infantmarmosetsvox as imv
 from vocdenoiser.datasets import marmaudio as ma
+from vocdenoiser.datasets import quality as q
 from vocdenoiser.denoise.eval import _load_label_map
 
 
@@ -135,6 +136,83 @@ def test_imv_extract_and_normalize_layout(tmp_path: Path):
 
     # Idempotent: re-normalizing moves nothing.
     assert imv._normalize_layout(root) == 0
+
+
+# ------------------------------- quality ---------------------------------
+
+def test_clip_quality_flags_clipping_and_silence():
+    sr = 96000
+    t = np.arange(int(0.3 * sr)) / sr
+    loud = 0.5 * np.sin(2 * np.pi * 8000 * t)
+    clipped = np.clip(3.0 * np.sin(2 * np.pi * 8000 * t), -1, 1)  # heavily railed
+    silent = np.zeros(len(t))
+
+    ql, qc, qs = q.clip_quality(loud, sr), q.clip_quality(clipped, sr), q.clip_quality(silent, sr)
+    assert qc["clip_frac"] > 0.1          # many samples at full scale
+    assert ql["clip_frac"] < 1e-3          # a 0.5-amplitude tone never rails
+    assert qs["peak_dbfs"] < -40           # near-silent
+    assert ql["peak_dbfs"] > -12
+    for key in q.QUALITY_COLS:
+        assert key in ql
+
+
+def test_quality_fail_reasons():
+    good = {"snr_db": 30, "active_frac": 0.2, "clip_frac": 0.0,
+            "peak_dbfs": -3, "duration_s": 0.5, "n_segments": 1}
+    assert q.quality_fail_reasons(good, min_snr=10, max_clip_frac=0.01) == []
+
+    bad = {"snr_db": 5, "active_frac": 0.001, "clip_frac": 0.2,
+           "peak_dbfs": -60, "duration_s": 0.02, "n_segments": 3}
+    reasons = q.quality_fail_reasons(
+        bad, min_snr=10, min_active_frac=0.01, max_clip_frac=0.01,
+        min_peak_dbfs=-40, min_dur=0.05, max_segments=1,
+    )
+    assert set(reasons) == {"low_snr", "low_active", "clipped", "near_silent", "too_short", "multi_source"}
+
+
+def _make_imv_root_with_silence(tmp_path: Path, sr=96000) -> Path:
+    root = tmp_path / "IMV"
+    (root / "data" / "twin_1").mkdir(parents=True)
+    y = np.zeros(int(2.0 * sr))
+    t = np.arange(int(0.5 * sr)) / sr
+    y[: len(t)] = 0.5 * np.sin(2 * np.pi * 8000 * t)  # loud call 0.0-0.5 s; 1.0-1.5 s is silence
+    _write_wav(root / "data" / "twin_1" / "20200101_Twin1_marmoset1.wav", y, sr)
+    with open(root / "labels.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["filename", "start", "end", "duration", "calltype", "caller"])
+        w.writerow(["20200101_Twin1_marmoset1", 0.0, 0.5, 0.5, 1, 0])   # loud
+        w.writerow(["20200101_Twin1_marmoset1", 1.0, 1.5, 0.5, 1, 0])   # silent
+    return root
+
+
+def test_imv_prepare_quality_filter_drops_silent(tmp_path: Path):
+    root = _make_imv_root_with_silence(tmp_path)
+    out_dir, out_csv = tmp_path / "clips", tmp_path / "l.csv"
+    s = imv.prepare(root, out_dir, out_csv, target_sr=0, min_peak_dbfs=-40)
+    assert s["n_written"] == 1
+    assert s["n_dropped_quality"] == 1
+    assert len(list(out_dir.glob("*.wav"))) == 1
+    with open(out_csv) as fh:
+        header = next(csv.reader(fh))
+    assert {"snr_db", "peak_dbfs", "clip_frac"} <= set(header)
+
+
+def test_imv_prepare_writes_quality_columns_by_default(tmp_path: Path):
+    root = _make_imv_root(tmp_path)
+    out_csv = tmp_path / "l.csv"
+    imv.prepare(root, tmp_path / "clips", out_csv, target_sr=0)
+    with open(out_csv) as fh:
+        rows = list(csv.DictReader(fh))
+    assert rows and rows[0]["snr_db"] != "" and rows[0]["peak_dbfs"] != ""
+
+
+def test_imv_prepare_no_quality_omits_columns(tmp_path: Path):
+    root = _make_imv_root(tmp_path)
+    out_csv = tmp_path / "l.csv"
+    imv.prepare(root, tmp_path / "clips", out_csv, target_sr=0, quality=False)
+    with open(out_csv) as fh:
+        header = next(csv.reader(fh))
+    assert "snr_db" not in header
 
 
 # ------------------------------- MarmAudio -------------------------------

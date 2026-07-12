@@ -58,6 +58,12 @@ from pathlib import Path
 import numpy as np
 
 from vocdenoiser.audio import read_wav
+from vocdenoiser.datasets.quality import (
+    QUALITY_COLS,
+    clip_quality,
+    quality_fail_reasons,
+    summarize,
+)
 
 # labels.csv calltype index -> name (from the dataset README). 11/12 are dropped.
 CALLTYPE_NAMES = {
@@ -167,17 +173,36 @@ def _write_wav(path: Path, sig: np.ndarray, sr: int, peak_normalize: bool) -> No
         w.writeframes(i16.tobytes())
 
 
-def write_label_csv(vocs: list[Vocalization], out_csv: str | Path, sr: int) -> None:
-    """Write the ``id,identity(,...)`` CSV. ``identity`` = caller for the RF proxy."""
+def _fmt_quality(q: dict, col: str) -> str:
+    val = q.get(col, "")
+    return f"{val:.4f}" if isinstance(val, float) else str(val)
+
+
+def write_label_csv(
+    vocs: list[Vocalization],
+    out_csv: str | Path,
+    sr: int,
+    qualities: dict[str, dict] | None = None,
+) -> None:
+    """Write the ``id,identity(,quality…)`` CSV. ``identity`` = caller for the RF proxy.
+
+    If ``qualities`` (``uid -> quality dict``) is given, per-clip quality columns
+    are appended so the label file doubles as a quality report.
+    """
     out_csv = Path(out_csv)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
+    base = ["id", "identity", "caller", "calltype", "calltype_name", "source_file", "start", "end", "sr"]
+    qcols = QUALITY_COLS if qualities else []
     with open(out_csv, "w", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["id", "identity", "caller", "calltype", "calltype_name",
-                         "source_file", "start", "end", "sr"])
+        writer.writerow(base + qcols)
         for v in vocs:
-            writer.writerow([v.uid, v.caller, v.caller, v.calltype, v.calltype_name,
-                             v.source_wav.name, f"{v.start:.4f}", f"{v.end:.4f}", sr])
+            row = [v.uid, v.caller, v.caller, v.calltype, v.calltype_name,
+                   v.source_wav.name, f"{v.start:.4f}", f"{v.end:.4f}", sr]
+            if qualities:
+                q = qualities.get(v.uid, {})
+                row += [_fmt_quality(q, c) for c in qcols]
+            writer.writerow(row)
 
 
 def prepare(
@@ -188,16 +213,34 @@ def prepare(
     peak_normalize: bool = False,
     limit: int | None = None,
     id_prefix: str = "imv",
+    quality: bool = True,
+    min_snr: float | None = None,
+    min_active_frac: float | None = None,
+    max_clip_frac: float | None = None,
+    min_peak_dbfs: float | None = None,
+    min_dur: float | None = None,
+    max_segments: int | None = None,
 ) -> dict:
     """Cut every vocalization into a clip and write the label CSV.
 
     Groups segments by source recording so each 10-minute WAV is read once.
     Segments whose source WAV is absent are skipped and counted (so a partial
     download still yields a usable subset).
+
+    With ``quality`` on (default), each clip is scored (SNR + level/clipping) and
+    the metrics are added to the CSV. Any ``min_*`` / ``max_*`` threshold given
+    additionally *drops* clips that fail it (external corpora vary in recording
+    quality), and the drop reasons are reported.
     """
     imv_root = Path(imv_root)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    thresholds = dict(min_snr=min_snr, min_active_frac=min_active_frac,
+                      max_clip_frac=max_clip_frac, min_peak_dbfs=min_peak_dbfs,
+                      min_dur=min_dur, max_segments=max_segments)
+    filtering = any(v is not None for v in thresholds.values())
+    score = quality or filtering
 
     vocs = parse_labels(imv_root / "labels.csv", imv_root, id_prefix=id_prefix)
     if limit is not None:
@@ -208,8 +251,12 @@ def prepare(
         by_file.setdefault(v.source_wav, []).append(v)
 
     written: list[Vocalization] = []
+    quals: dict[str, dict] = {}
+    scored: list[dict] = []
+    drop_reasons: dict[str, int] = {}
     n_missing_files = 0
     n_empty = 0
+    n_dropped_quality = 0
     warned: list[bool] = []
     for source_wav, segs in sorted(by_file.items(), key=lambda kv: str(kv[0])):
         if not source_wav.exists():
@@ -224,11 +271,22 @@ def prepare(
                 n_empty += 1
                 continue
             clip = _resample(full[a:b], sr, out_sr, warned)
+            q = clip_quality(clip, out_sr) if score else None
+            if filtering:
+                reasons = quality_fail_reasons(q, **thresholds)
+                if reasons:
+                    n_dropped_quality += 1
+                    for r in reasons:
+                        drop_reasons[r] = drop_reasons.get(r, 0) + 1
+                    continue
             _write_wav(out_dir / f"{v.uid}.wav", clip, out_sr, peak_normalize)
             written.append(v)
+            if q is not None:
+                quals[v.uid] = q
+                scored.append(q)
 
     out_sr = target_sr if target_sr > 0 else 44_100
-    write_label_csv(written, out_csv, out_sr)
+    write_label_csv(written, out_csv, out_sr, quals or None)
 
     n_callers = len({v.caller for v in written})
     summary = {
@@ -236,6 +294,7 @@ def prepare(
         "n_written": len(written),
         "n_missing_source_files": n_missing_files,
         "n_empty_segments": n_empty,
+        "n_dropped_quality": n_dropped_quality,
         "n_callers": n_callers,
         "target_sr": out_sr,
         "clips_dir": str(out_dir),
@@ -248,6 +307,11 @@ def prepare(
     )
     if n_missing_files:
         print(f"  NOTE: {n_missing_files} source recordings absent (partial download) — segments skipped.")
+    if filtering:
+        reason_str = ", ".join(f"{k}={v}" for k, v in sorted(drop_reasons.items())) or "none"
+        print(f"  quality filter dropped {n_dropped_quality} clips ({reason_str}).")
+    if scored:
+        print(summarize(scored))
     return summary
 
 
@@ -357,6 +421,20 @@ def main(argv: list[str] | None = None) -> None:
                    help="peak-normalize each clip (matches the reference Dataset)")
     p.add_argument("--limit", type=int, default=None, help="cap number of vocalizations (quick subset)")
     p.add_argument("--id-prefix", default="imv", help="clip id prefix")
+    # Call-quality: scored by default (metrics added to the CSV + a summary printed).
+    # Any threshold below also DROPS clips that fail it.
+    p.add_argument("--no-quality", dest="quality", action="store_false",
+                   help="skip per-clip quality scoring (faster; no quality columns)")
+    p.add_argument("--min-snr", type=float, default=None, help="drop clips with snr_db below this")
+    p.add_argument("--min-active-frac", type=float, default=None,
+                   help="drop clips with active_frac below this (near-silent / bad boundaries)")
+    p.add_argument("--max-clip-frac", type=float, default=None,
+                   help="drop clips with more than this fraction of samples clipped")
+    p.add_argument("--min-peak-dbfs", type=float, default=None,
+                   help="drop clips whose peak level is below this dBFS (near-silent)")
+    p.add_argument("--min-dur", type=float, default=None, help="drop clips shorter than this many seconds")
+    p.add_argument("--max-segments", type=int, default=None,
+                   help="drop clips with more than this many active segments (co-occurring sources)")
     p.add_argument("--download", action="store_true",
                    help="fetch + extract the twin audio tarballs from Zenodo (~21 GB) first")
     p.add_argument("--twins", type=int, nargs="+", default=list(ALL_TWINS),
@@ -376,7 +454,10 @@ def main(argv: list[str] | None = None) -> None:
     out_dir = args.out_dir or imv_root / "clips"
     out_csv = args.out_csv or imv_root / "imv_labels.csv"
     prepare(imv_root, out_dir, out_csv, target_sr=args.target_sr,
-            peak_normalize=args.peak_normalize, limit=args.limit, id_prefix=args.id_prefix)
+            peak_normalize=args.peak_normalize, limit=args.limit, id_prefix=args.id_prefix,
+            quality=args.quality, min_snr=args.min_snr, min_active_frac=args.min_active_frac,
+            max_clip_frac=args.max_clip_frac, min_peak_dbfs=args.min_peak_dbfs,
+            min_dur=args.min_dur, max_segments=args.max_segments)
 
 
 if __name__ == "__main__":
