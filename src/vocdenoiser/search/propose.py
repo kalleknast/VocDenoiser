@@ -32,12 +32,18 @@ class Proposer:
         init_random: int = 6,
         frontier_k: int = 8,
         p_crossover: float = 0.3,
+        explore_rate: float = 0.0,
         llm_fn: LLMFn | None = None,
         llm_every: int = 1,
     ) -> None:
         self.init_random = init_random
         self.frontier_k = frontier_k
         self.p_crossover = p_crossover
+        # ε-greedy exploration: even once a frontier exists, propose a fresh random
+        # candidate this fraction of the time. Pure hill-climbing off a frontier that
+        # converged under a small budget stays stuck in one basin (the ledger showed
+        # a plateau over iters 30-58); random restarts re-seed distant regions.
+        self.explore_rate = explore_rate
         self.llm_fn = llm_fn
         self.llm_every = llm_every
         self._n = 0
@@ -50,6 +56,10 @@ class Proposer:
         frontier = ledger.frontier(self.frontier_k)
 
         if len(records) < self.init_random or not frontier:
+            return random_candidate(rng, origin="random")
+
+        if self.explore_rate and rng.random() < self.explore_rate:
+            self.last_rationale = "explore (ε-greedy random restart)"
             return random_candidate(rng, origin="random")
 
         if self.llm_fn is not None and (self._n % self.llm_every == 0):

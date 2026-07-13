@@ -73,11 +73,21 @@ class Config:
     # --- Model ------------------------------------------------------------
     latent_dim: int = 16  # scientifically validated for marmoset similarity (SPECS)
     base_channels: int = 32  # encoder ch = [32, 64, 128, 256]
-    beta: float = 4.0  # KL weight in L = MSE + beta * D_KL
+    beta: float = 4.0  # KL weight in L = recon + beta * D_KL
+    # Reconstruction term: "l1" (sharper spectrograms, robust to outliers — the
+    # architecture search preferred it over MSE) or "l2" (Gaussian NLL / MSE).
+    recon_loss: str = "l1"
+    # KL schedule: "warmup" ramps beta 0 -> beta over the first `beta_warmup_epochs`
+    # epochs so reconstruction is learned before KL pressure engages (guards against
+    # early posterior collapse); "const" holds beta fixed.
+    beta_schedule: str = "warmup"
+    beta_warmup_epochs: int = 5
 
     # --- Optimisation -----------------------------------------------------
     batch_size: int = 32
     lr: float = 1e-3
+    optimizer: str = "adamw"  # "adam" or "adamw" (decoupled weight decay)
+    weight_decay: float = 1e-4  # AdamW decoupled L2; 0 makes AdamW behave like Adam
     max_epochs: int = 100
     # Early stopping on val_loss: halt after this many epochs with no improvement
     # (0 disables — train the full max_epochs). val_loss plateaus by ~epoch 5-10 on

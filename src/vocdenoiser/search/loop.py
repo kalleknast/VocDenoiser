@@ -25,6 +25,9 @@ class SearchConfig:
     frontier_k: int = 8
     seed: int = 0
     max_skips: int = 50  # consecutive duplicate proposals before giving up
+    # Prefer the smaller model when metrics are statistically tied. Turn off under
+    # a small per-candidate budget, where compact models win only on train speed.
+    simplicity_tiebreak: bool = True
 
 
 def run_search(
@@ -63,6 +66,7 @@ def run_search(
                 res.metric, res.metric_std, incumbent.metric, incumbent.metric_std,
                 k_sigma=cfg.k_sigma,
                 challenger_params=res.num_params, incumbent_params=incumbent.num_params,
+                simplicity_tiebreak=cfg.simplicity_tiebreak,
             )
             status = "keep" if dec.accept else "discard"
             decision_reason = dec.reason

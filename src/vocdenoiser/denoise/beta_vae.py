@@ -7,10 +7,12 @@ reconstructing the cleaned spectrogram at the exact input shape.
 
 Objective (supervised noisy→clean):
 
-    L = MSE(x̂, x_clean) + β · D_KL( q(z|x_noisy) ‖ N(0, I) )
+    L = recon(x̂, x_clean) + β · D_KL( q(z|x_noisy) ‖ N(0, I) )
 
-The encoder consumes the *noisy* spectrogram; the reconstruction target is the
-*clean* one. With ``β`` configurable, ``β = 1`` recovers a vanilla VAE.
+where ``recon`` is L1 (default) or MSE and ``β`` may be linearly warmed up over
+the first few epochs (see :class:`Config`). The encoder consumes the *noisy*
+spectrogram; the reconstruction target is the *clean* one. With a constant
+``β = 1`` and L2, this reduces to a vanilla VAE.
 """
 
 from __future__ import annotations
@@ -90,6 +92,17 @@ class BetaVAE(L.LightningModule):
         return self.decode(z), mu, logvar
 
     # --- loss / steps -----------------------------------------------------
+    def _beta(self) -> float:
+        """Current KL weight. ``warmup`` ramps 0 → ``cfg.beta`` linearly over the
+        first ``cfg.beta_warmup_epochs`` epochs so the model learns to reconstruct
+        before KL pressure engages (mitigates early posterior collapse); ``const``
+        holds it fixed. Ramp is measured in optimizer steps for a smooth schedule."""
+        if self.cfg.beta_schedule == "warmup" and self.trainer is not None:
+            spe = int(getattr(self.trainer, "num_training_batches", 0) or 0)
+            warm = max(1, self.cfg.beta_warmup_epochs) * max(1, spe)
+            return self.cfg.beta * min(1.0, (self.global_step + 1) / warm)
+        return self.cfg.beta
+
     def loss(
         self,
         recon: torch.Tensor,
@@ -97,28 +110,33 @@ class BetaVAE(L.LightningModule):
         mu: torch.Tensor,
         logvar: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        mse = F.mse_loss(recon, target, reduction="mean")
+        # L1 (default) gives sharper, more outlier-robust spectrogram reconstructions
+        # than MSE; both reduce over all bins. The search preferred L1 decisively.
+        if self.cfg.recon_loss == "l1":
+            recon_err = F.l1_loss(recon, target, reduction="mean")
+        else:
+            recon_err = F.mse_loss(recon, target, reduction="mean")
         # KL of q(z|x) ‖ N(0, I): sum over latent dims, mean over the batch.
         kl = -0.5 * torch.mean(
             torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
         )
         # Weight the reconstruction by the number of spectrogram bins so it is on
-        # the same scale as the latent-summed KL (equivalently: sum the Gaussian
-        # log-likelihood over bins). Without this, MSE averaged over ~32k bins is
-        # ~n_bins smaller than β·KL, so the objective is >99.9% KL and the model
-        # collapses the posterior instead of learning to denoise. `mse`/`kl` are
-        # still returned unweighted for readable logging.
+        # the same scale as the latent-summed KL (equivalently: sum the per-bin recon
+        # log-likelihood). Without this, a per-bin-mean recon (~1/n_bins) is dwarfed
+        # by β·KL, so the objective is >99.9% KL and the model collapses the posterior
+        # instead of learning to denoise. `recon_err`/`kl` are returned unweighted for
+        # readable logging.
         n_bins = target[0].numel()
-        total = n_bins * mse + self.cfg.beta * kl
-        return total, mse, kl
+        total = n_bins * recon_err + self._beta() * kl
+        return total, recon_err, kl
 
     def _step(self, batch: tuple[torch.Tensor, torch.Tensor], stage: str) -> torch.Tensor:
         noisy, clean = batch
         recon, mu, logvar = self(noisy)
-        total, mse, kl = self.loss(recon, clean, mu, logvar)
+        total, recon_err, kl = self.loss(recon, clean, mu, logvar)
         bs = noisy.size(0)
         self.log_dict(
-            {f"{stage}_loss": total, f"{stage}_mse": mse, f"{stage}_kl": kl},
+            {f"{stage}_loss": total, f"{stage}_recon": recon_err, f"{stage}_kl": kl},
             prog_bar=(stage == "val"),
             batch_size=bs,
         )
@@ -137,4 +155,5 @@ class BetaVAE(L.LightningModule):
         return self._step(batch, "val")
 
     def configure_optimizers(self):  # noqa: D102
-        return torch.optim.Adam(self.parameters(), lr=self.cfg.lr)
+        opt_cls = torch.optim.AdamW if self.cfg.optimizer == "adamw" else torch.optim.Adam
+        return opt_cls(self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)

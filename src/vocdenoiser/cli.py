@@ -106,20 +106,38 @@ def cmd_search_run(args) -> None:
             overrides["data_root"] = args.data_root
         if args.noise_dirs:
             overrides["noise_dirs"] = tuple(args.noise_dirs)
-        harness = TorchHarness(base_config_overrides=overrides, max_steps=args.max_steps)
+        harness = TorchHarness(
+            base_config_overrides=overrides,
+            max_steps=args.max_steps,
+            max_time=args.max_time,
+        )
 
     ledger = Ledger(_resolve_ledger(args.ledger))
-    proposer = Proposer(frontier_k=args.frontier_k)
+    proposer = Proposer(frontier_k=args.frontier_k, explore_rate=args.explore_rate)
     cfg = SearchConfig(
         iters=args.iters,
         seeds=tuple(args.seeds),
         k_sigma=args.k_sigma,
         frontier_k=args.frontier_k,
         seed=args.seed,
+        simplicity_tiebreak=args.simplicity_tiebreak,
     )
     best = run_search(harness, ledger, proposer, cfg)
     if best:
         print(f"\nBest: metric={best.metric:+.3f} id={best.id}\n{best.candidate}")
+        # Optional confirmation pass: the frontier was ranked at the per-iteration
+        # `--seeds` budget (often 2 seeds); re-evaluate the winner at more seeds to
+        # tighten its metric_std before you commit to it. Print-only — not written to
+        # the ledger, so it can't perturb the frontier / dedup bookkeeping.
+        if args.final_seeds and args.final_seeds > len(args.seeds):
+            from vocdenoiser.search.space import Candidate
+
+            seeds = list(range(args.final_seeds))
+            print(f"\nFinal verification: re-evaluating best ({best.id}) at "
+                  f"{args.final_seeds} seeds {seeds}...")
+            res = harness.evaluate(Candidate.from_dict(best.candidate), seeds)
+            print(f"  refined metric = {res.metric:+.3f} ± {res.metric_std:.3f} "
+                  f"(ranking estimate was {best.metric:+.3f} ± {best.metric_std:.3f})")
 
 
 def cmd_search_report(args) -> None:
@@ -192,11 +210,29 @@ def build_parser() -> argparse.ArgumentParser:
                     help="ledger JSONL path; default artifacts/search_ledger.jsonl under "
                          "$VOCDENOISER_OUTPUT_ROOT (Drive on Colab) so the search resumes")
     sr.add_argument("--iters", type=int, default=40)
-    sr.add_argument("--seeds", type=int, nargs="+", default=[0, 1])
+    sr.add_argument("--seeds", type=int, nargs="+", default=[0, 1],
+                    help="seeds averaged per candidate during ranking (more = less noise)")
     sr.add_argument("--k-sigma", type=float, default=1.0)
     sr.add_argument("--frontier-k", type=int, default=8)
     sr.add_argument("--seed", type=int, default=0)
-    sr.add_argument("--max-steps", type=int, default=400, help="torch harness compute budget")
+    sr.add_argument("--max-steps", type=int, default=1500,
+                    help="torch harness per-candidate compute budget (optimizer steps); "
+                         "set -1 for no step cap and rely on --max-time")
+    sr.add_argument("--max-time", default=None,
+                    help="torch harness per-candidate wall-clock cap as DD:HH:MM:SS "
+                         "(e.g. 00:00:03:00 = 3 min); stops at whichever of this / "
+                         "--max-steps comes first")
+    sr.add_argument("--explore-rate", type=float, default=0.2,
+                    help="ε-greedy: fraction of proposals that are fresh random restarts "
+                         "even once a frontier exists (0 = pure hill-climb)")
+    sr.add_argument("--final-seeds", type=int, default=0,
+                    help="if > len(--seeds), re-evaluate the winning candidate at this many "
+                         "seeds at the end and print a tightened metric (print-only)")
+    sr.add_argument("--simplicity-tiebreak", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="within the noise band prefer the smaller model; use "
+                         "--no-simplicity-tiebreak under a small budget where compact "
+                         "models win only on train speed")
     sr.add_argument("--data-root", default=None, help="clean-call root (torch harness)")
     sr.add_argument("--noise-dirs", nargs="+", default=None,
                     help="real colony-noise dirs for the torch harness (e.g. /content/Noise "
