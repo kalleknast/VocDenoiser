@@ -17,6 +17,8 @@ spectrogram; the reconstruction target is the *clean* one. With a constant
 
 from __future__ import annotations
 
+import math
+
 import lightning as L
 import torch
 import torch.nn.functional as F
@@ -96,12 +98,20 @@ class BetaVAE(L.LightningModule):
         """Current KL weight. ``warmup`` ramps 0 → ``cfg.beta`` linearly over the
         first ``cfg.beta_warmup_epochs`` epochs so the model learns to reconstruct
         before KL pressure engages (mitigates early posterior collapse); ``const``
-        holds it fixed. Ramp is measured in optimizer steps for a smooth schedule."""
-        if self.cfg.beta_schedule == "warmup" and self.trainer is not None:
-            spe = int(getattr(self.trainer, "num_training_batches", 0) or 0)
-            warm = max(1, self.cfg.beta_warmup_epochs) * max(1, spe)
-            return self.cfg.beta * min(1.0, (self.global_step + 1) / warm)
-        return self.cfg.beta
+        holds it fixed."""
+        if self.cfg.beta_schedule != "warmup" or self.trainer is None:
+            return self.cfg.beta
+        warm_epochs = max(1, self.cfg.beta_warmup_epochs)
+        # Prefer a smooth per-step ramp, but trainer.num_training_batches is +inf
+        # until the train loop is set up (e.g. during the pre-training validation
+        # sanity check, where int(inf) would overflow), so fall back to a coarse
+        # per-epoch ramp whenever it isn't a finite positive count yet.
+        spe = getattr(self.trainer, "num_training_batches", float("inf"))
+        if math.isfinite(spe) and spe > 0:
+            frac = (self.global_step + 1) / (warm_epochs * spe)
+        else:
+            frac = self.current_epoch / warm_epochs
+        return self.cfg.beta * min(1.0, frac)
 
     def loss(
         self,
