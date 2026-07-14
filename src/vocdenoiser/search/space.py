@@ -20,10 +20,16 @@ from dataclasses import asdict, dataclass, field, replace
 import numpy as np
 
 # Discrete choice sets and continuous (log-uniform) ranges for each knob.
+# Size upper-bounds are capped to keep every candidate within ~4M params (the hand model's
+# scale). A fixed per-candidate budget cannot train a 10M-param net to convergence, so
+# oversized models were scored *undertrained* — the metric became a proxy for convergence
+# speed (params↔metric anti-correlated at ≈-0.54 in the 70-record ledger) rather than
+# architecture quality. Dropping n_conv_layers=5 / base_channels=64 also removed two
+# observed crash modes. Widen these again only alongside a much larger training budget.
 CHOICES = {
-    "n_conv_layers": [3, 4, 5],
-    "base_channels": [16, 24, 32, 48, 64],
-    "channel_mult": [1.5, 2.0, 2.5],
+    "n_conv_layers": [3, 4],
+    "base_channels": [16, 24, 32, 48],
+    "channel_mult": [1.5, 2.0],
     "kernel_size": [3, 4, 5],
     "norm": ["batch", "group", "none"],
     "act": ["leaky_relu", "gelu", "silu"],
