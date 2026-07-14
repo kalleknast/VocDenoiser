@@ -147,6 +147,11 @@ class TorchHarness:
                 trainer = L.Trainer(
                     max_steps=self.max_steps,
                     max_time=self.max_time,
+                    # Clip gradients (as the hand-model trainer does) so a large early
+                    # gradient — e.g. from a residual candidate whose reconstruction starts
+                    # at ≈ the noisy input — can't explode the weights to NaN and get the
+                    # candidate silently scored -inf.
+                    gradient_clip_val=1.0,
                     enable_checkpointing=False,
                     logger=False,
                     enable_progress_bar=False,

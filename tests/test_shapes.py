@@ -64,6 +64,44 @@ def test_config_rejects_indivisible_geometry():
         Config(n_mels=30, n_frames=32)  # 30 not divisible by the 2**4 downsample
 
 
+def test_search_model_residual_l2_stays_finite():
+    """Every residual=True search candidate crashed (NaN blowup) because the config model
+    lacked the hand model's guards. Residual makes recon start at ≈ the large-magnitude
+    noisy input, so the first-step loss/grads are large; with L2 + no logvar clamp / no
+    grad clip it NaN'd. Check the worst case (residual, l2) stays finite through a few
+    aggressive optimizer steps — the harness supplies the grad-clip the Trainer would."""
+    from vocdenoiser.search.model_factory import build_search_model
+    from vocdenoiser.search.space import Candidate
+
+    cfg = _tiny_cfg(base_channels=16)
+    cand = Candidate(
+        n_conv_layers=4, base_channels=16, channel_mult=2.0, kernel_size=4,
+        norm="none", act="silu", latent_dim=8, residual=True, recon_loss="l2",
+        beta=6.0, beta_schedule="warmup", optimizer="adam", lr=3e-3, batch_size=2,
+    )
+    model = build_search_model(cand, cfg)
+
+    # The logvar clamp is present (the deterministic guard against exp() overflow).
+    _, logvar = model.encode(torch.randn(2, *cfg.spec_shape))
+    assert logvar.abs().max().item() <= 10.0 + 1e-4
+
+    opt = model.configure_optimizers()
+    for _ in range(5):
+        opt.zero_grad()
+        noisy = 20.0 * torch.randn(2, *cfg.spec_shape)  # large magnitude, like raw log-mel
+        clean = 20.0 * torch.randn(2, *cfg.spec_shape)
+        recon, mu, logvar = model(noisy)
+        assert recon.shape == noisy.shape  # residual add requires matching shapes
+        total, _, _ = model._loss(recon, clean, mu, logvar)
+        assert torch.isfinite(total)
+        total.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # what the harness Trainer does
+        opt.step()
+
+    mu, logvar = model.encode(20.0 * torch.randn(2, *cfg.spec_shape))
+    assert torch.isfinite(mu).all() and torch.isfinite(logvar).all()
+
+
 # --- real-noise mixing (extension beyond SPECS.md) ------------------------
 
 def test_noise_bed_weight_one_is_the_real_background():

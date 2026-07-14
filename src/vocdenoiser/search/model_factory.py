@@ -98,7 +98,14 @@ class ConfigurableBetaVAE(L.LightningModule):
 
     def encode(self, x):
         h = self.encoder(x).flatten(1)
-        return self.fc_mu(h), self.fc_logvar(h)
+        # Clamp logvar so exp(logvar) / exp(0.5·logvar) can't overflow float32 to inf/NaN
+        # (mirrors the hand-designed BetaVAE). Without it, aggressive candidates — notably
+        # residual ones, whose reconstruction starts at ≈ the large-magnitude noisy input,
+        # so the initial loss/gradients are large — blow up in the first steps and the whole
+        # candidate is scored -inf. This was a systematic crash: every residual=True
+        # candidate died (100%) until this guard + grad-clipping (harness) landed.
+        logvar = self.fc_logvar(h).clamp(-10.0, 10.0)
+        return self.fc_mu(h), logvar
 
     @staticmethod
     def reparameterize(mu, logvar):
@@ -140,7 +147,13 @@ class ConfigurableBetaVAE(L.LightningModule):
         return total
 
     def training_step(self, batch, _):
-        return self._step(batch, "train")
+        loss = self._step(batch, "train")
+        # A single non-finite batch must not poison the weights: gradient clipping caps
+        # magnitude but does NOT sanitize a NaN, so skip the optimizer step on non-finite
+        # loss (mirrors BetaVAE).
+        if not torch.isfinite(loss):
+            return None
+        return loss
 
     def validation_step(self, batch, _):
         return self._step(batch, "val")
