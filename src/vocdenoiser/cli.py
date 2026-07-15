@@ -113,7 +113,11 @@ def cmd_search_run(args) -> None:
         )
 
     ledger = Ledger(_resolve_ledger(args.ledger))
-    proposer = Proposer(frontier_k=args.frontier_k, explore_rate=args.explore_rate)
+    proposer = Proposer(
+        frontier_k=args.frontier_k,
+        explore_rate=args.explore_rate,
+        max_params=args.max_params or None,  # 0 -> no cap
+    )
     cfg = SearchConfig(
         iters=args.iters,
         seeds=tuple(args.seeds),
@@ -147,6 +151,8 @@ def cmd_search_report(args) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from vocdenoiser.search.space import MAX_PARAMS  # torch-free; safe at parser build
+
     parser = argparse.ArgumentParser(prog="vocdenoiser")
     sub = parser.add_subparsers(dest="group", required=True)
 
@@ -222,9 +228,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="torch harness per-candidate wall-clock cap as DD:HH:MM:SS "
                          "(e.g. 00:00:03:00 = 3 min); stops at whichever of this / "
                          "--max-steps comes first")
-    sr.add_argument("--explore-rate", type=float, default=0.2,
+    sr.add_argument("--explore-rate", type=float, default=0.35,
                     help="ε-greedy: fraction of proposals that are fresh random restarts "
-                         "even once a frontier exists (0 = pure hill-climb)")
+                         "even once a frontier exists (0 = pure hill-climb). Raised from 0.2 "
+                         "after search_ledger_v2: evolution off the frontier produced 7 "
+                         "straight in-noise results while the incumbent itself came from a "
+                         "random restart, so exploration was carrying the search")
+    sr.add_argument("--max-params", type=int, default=MAX_PARAMS,
+                    help="reject proposals whose computed parameter count exceeds this "
+                         "(0 = no cap); a fixed per-candidate budget cannot train an "
+                         "oversized net to convergence, so it scores undertrained")
     sr.add_argument("--final-seeds", type=int, default=0,
                     help="if > len(--seeds), re-evaluate the winning candidate at this many "
                          "seeds at the end and print a tightened metric (print-only)")

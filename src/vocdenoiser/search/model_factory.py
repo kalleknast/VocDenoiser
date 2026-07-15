@@ -23,6 +23,19 @@ from vocdenoiser.search.space import Candidate
 
 _ACT = {"leaky_relu": lambda: nn.LeakyReLU(0.2, inplace=True), "gelu": nn.GELU, "silu": nn.SiLU}
 
+# Consecutive non-finite training steps tolerated before a candidate is declared diverged.
+# Comfortably above a transient bad batch (the stability guards recover within a step or two)
+# and far below the per-candidate step budget.
+NONFINITE_PATIENCE = 25
+
+
+class CandidateDiverged(RuntimeError):
+    """Training collapsed to a persistent non-finite loss; stop burning the budget.
+
+    Raised out of ``training_step`` so the harness's existing crash handling records it as
+    a normal crashed candidate (metric -inf) — the search continues.
+    """
+
 
 def _norm(kind: str, ch: int) -> nn.Module:
     if kind == "batch":
@@ -41,10 +54,14 @@ def _norm(kind: str, ch: int) -> nn.Module:
 class ConfigurableBetaVAE(L.LightningModule):
     """A β-VAE whose depth/width/kernel/norm/act/residual come from a Candidate."""
 
-    def __init__(self, cand: Candidate, cfg: Config) -> None:
+    def __init__(
+        self, cand: Candidate, cfg: Config, nonfinite_patience: int = NONFINITE_PATIENCE
+    ) -> None:
         super().__init__()
         self.cand = cand
         self.cfg = cfg
+        self.nonfinite_patience = nonfinite_patience
+        self._nonfinite_streak = 0
         self.save_hyperparameters(ignore=["cand", "cfg"])
 
         n = cand.n_conv_layers
@@ -152,7 +169,19 @@ class ConfigurableBetaVAE(L.LightningModule):
         # magnitude but does NOT sanitize a NaN, so skip the optimizer step on non-finite
         # loss (mirrors BetaVAE).
         if not torch.isfinite(loss):
+            self._nonfinite_streak += 1
+            # Skipping every step is not recovery — a diverged candidate would otherwise
+            # sit out its whole budget doing no work and still be scored -inf at the end
+            # (4 such candidates burned 2.7h of a 16.8h run in search_ledger_v2). Once the
+            # streak shows it is not a transient bad batch, abort: the harness catches this
+            # and records the same "crash", just orders of magnitude cheaper.
+            if self._nonfinite_streak >= self.nonfinite_patience:
+                raise CandidateDiverged(
+                    f"{self.cand.id}: loss non-finite for {self._nonfinite_streak} "
+                    f"consecutive steps (step {self.global_step}) — aborting"
+                )
             return None
+        self._nonfinite_streak = 0
         return loss
 
     def validation_step(self, batch, _):

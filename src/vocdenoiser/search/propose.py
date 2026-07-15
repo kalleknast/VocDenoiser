@@ -19,7 +19,13 @@ from pathlib import Path
 import numpy as np
 
 from vocdenoiser.search.ledger import Ledger
-from vocdenoiser.search.space import Candidate, crossover, mutate, random_candidate
+from vocdenoiser.search.space import (
+    MAX_PARAMS,
+    Candidate,
+    crossover,
+    mutate,
+    random_candidate,
+)
 
 LLMFn = Callable[[str], str]  # prompt -> JSON candidate (possibly with extra keys)
 
@@ -33,6 +39,7 @@ class Proposer:
         frontier_k: int = 8,
         p_crossover: float = 0.3,
         explore_rate: float = 0.0,
+        max_params: int | None = MAX_PARAMS,
         llm_fn: LLMFn | None = None,
         llm_every: int = 1,
     ) -> None:
@@ -44,6 +51,9 @@ class Proposer:
         # converged under a small budget stays stuck in one basin (the ledger showed
         # a plateau over iters 30-58); random restarts re-seed distant regions.
         self.explore_rate = explore_rate
+        # Size ceiling handed to every operator, so a proposal is rejected before it costs
+        # a full training budget to discover it is oversized.
+        self.max_params = max_params
         self.llm_fn = llm_fn
         self.llm_every = llm_every
         self._n = 0
@@ -56,11 +66,11 @@ class Proposer:
         frontier = ledger.frontier(self.frontier_k)
 
         if len(records) < self.init_random or not frontier:
-            return random_candidate(rng, origin="random")
+            return random_candidate(rng, origin="random", max_params=self.max_params)
 
         if self.explore_rate and rng.random() < self.explore_rate:
             self.last_rationale = "explore (ε-greedy random restart)"
-            return random_candidate(rng, origin="random")
+            return random_candidate(rng, origin="random", max_params=self.max_params)
 
         if self.llm_fn is not None and (self._n % self.llm_every == 0):
             cand = self._propose_llm(ledger, frontier)
@@ -73,12 +83,14 @@ class Proposer:
         cands = [Candidate.from_dict(r.candidate) for r in frontier]
         if len(cands) >= 2 and rng.random() < self.p_crossover:
             a, b = rng.choice(len(cands), size=2, replace=False)
-            return crossover(cands[a], cands[b], rng)
+            return crossover(cands[a], cands[b], rng, max_params=self.max_params)
         # Bias mutation toward the better frontier members.
         weights = np.linspace(len(cands), 1, len(cands))
         weights = weights / weights.sum()
         parent = cands[int(rng.choice(len(cands), p=weights))]
-        return mutate(parent, rng, n_edits=int(rng.choice([1, 1, 2])))
+        return mutate(
+            parent, rng, n_edits=int(rng.choice([1, 1, 2])), max_params=self.max_params
+        )
 
     def _propose_llm(self, ledger: Ledger, frontier) -> Candidate | None:
         prompt = build_llm_prompt(ledger, frontier)

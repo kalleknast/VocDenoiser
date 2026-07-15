@@ -102,6 +102,61 @@ def test_search_model_residual_l2_stays_finite():
     assert torch.isfinite(mu).all() and torch.isfinite(logvar).all()
 
 
+def test_estimate_params_matches_factory():
+    """``estimate_params`` mirrors the factory's construction arithmetic in pure Python so
+    the (torch-free) operators can reject oversized candidates before paying to build them.
+    That duplication is only safe while the two agree exactly — this is the guard. It
+    reproduces every num_params in both shipped ledgers; here it is checked against the
+    real module across the families that stress it (norm affine params, odd/even kernels,
+    both depths, channel_mult rounding)."""
+    from vocdenoiser.search.model_factory import build_search_model
+    from vocdenoiser.search.space import Candidate, estimate_params
+
+    for n_conv_layers in (3, 4):
+        for norm in ("batch", "group", "none"):
+            for kernel_size in (3, 4, 5):
+                for channel_mult in (1.5, 2.0):
+                    cand = Candidate(
+                        n_conv_layers=n_conv_layers, base_channels=16,
+                        channel_mult=channel_mult, kernel_size=kernel_size, norm=norm,
+                        latent_dim=8,
+                    )
+                    cfg = _tiny_cfg(n_mels=64, n_frames=64, base_channels=16, latent_dim=8)
+                    model = build_search_model(cand, cfg)
+                    actual = sum(p.numel() for p in model.parameters())
+                    predicted = estimate_params(cand, n_mels=64, n_frames=64)
+                    assert predicted == actual, (
+                        f"estimate_params drifted from the factory for {cand}: "
+                        f"predicted {predicted}, built {actual}"
+                    )
+
+
+def test_diverged_candidate_aborts_instead_of_burning_its_budget():
+    """A candidate that NaNs used to skip every remaining step and still be scored -inf at
+    the end — 4 such candidates burned 2.7h of a 16.8h run in search_ledger_v2. Once the
+    non-finite streak passes the patience it must raise, so the harness can record the same
+    crash immediately. A transient bad batch must NOT trip it."""
+    from vocdenoiser.search.model_factory import CandidateDiverged, build_search_model
+    from vocdenoiser.search.space import Candidate
+
+    cfg = _tiny_cfg()
+    model = build_search_model(Candidate(base_channels=8, latent_dim=16), cfg)
+    model.nonfinite_patience = 3
+    batch = (torch.randn(2, *cfg.spec_shape), torch.randn(2, *cfg.spec_shape))
+
+    # A finite step resets the streak: two non-finite steps either side of a good one
+    # must not abort (patience is about persistent divergence, not one bad batch).
+    nan_batch = (torch.full((2, *cfg.spec_shape), float("nan")), batch[1])
+    assert model.training_step(nan_batch, 0) is None  # skipped, not raised
+    assert model.training_step(nan_batch, 0) is None
+    assert torch.isfinite(model.training_step(batch, 0))
+    assert model._nonfinite_streak == 0
+
+    with pytest.raises(CandidateDiverged):
+        for _ in range(model.nonfinite_patience):
+            model.training_step(nan_batch, 0)
+
+
 # --- real-noise mixing (extension beyond SPECS.md) ------------------------
 
 def test_noise_bed_weight_one_is_the_real_background():

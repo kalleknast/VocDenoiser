@@ -122,7 +122,7 @@ class TorchHarness:
         from vocdenoiser.denoise.config import Config
         from vocdenoiser.denoise.train import build_dataloaders
         from vocdenoiser.search.metric import spectrogram_si_sdr
-        from vocdenoiser.search.model_factory import build_search_model
+        from vocdenoiser.search.model_factory import CandidateDiverged, build_search_model
 
         metrics: list[float] = []
         nparams = 0
@@ -161,6 +161,14 @@ class TorchHarness:
                 m = spectrogram_si_sdr(model, val_dl, max_batches=self.val_batches)
                 if torch.cuda.is_available():
                     peak_vram = torch.cuda.max_memory_allocated() / 1e6
+            except CandidateDiverged as exc:
+                # An expected outcome, not a bug: the candidate blew up and aborted early
+                # instead of sitting out its budget. Log the reason without a traceback.
+                print(f"  candidate {c.id} diverged (seed {seed}): {exc}")
+                return EvalResult(
+                    metric=float("-inf"), status="crash", seeds=list(seeds),
+                    num_params=nparams, train_seconds=time.time() - t0,
+                )
             except Exception as exc:  # noqa: BLE001 - a crashed candidate is logged, not fatal
                 # Surface WHY it crashed — otherwise a systematic bug (e.g. a shape
                 # mismatch hitting a whole family of candidates) is invisible behind a

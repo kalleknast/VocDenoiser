@@ -1,5 +1,8 @@
 """Tests for the architecture-search framework (numpy-only; MockHarness)."""
 
+from collections import Counter
+from dataclasses import replace
+
 import numpy as np
 
 from vocdenoiser.search.accept import noise_aware_accept
@@ -7,7 +10,15 @@ from vocdenoiser.search.harness import MockHarness
 from vocdenoiser.search.ledger import Ledger, Record
 from vocdenoiser.search.loop import SearchConfig, run_search
 from vocdenoiser.search.propose import Proposer
-from vocdenoiser.search.space import Candidate, crossover, mutate, random_candidate
+from vocdenoiser.search.space import (
+    CHOICES,
+    MAX_PARAMS,
+    Candidate,
+    crossover,
+    estimate_params,
+    mutate,
+    random_candidate,
+)
 
 
 def test_candidate_id_stable_and_ignores_bookkeeping():
@@ -33,6 +44,61 @@ def test_mutate_changes_something():
     rng = np.random.RandomState(1)
     c = Candidate()
     assert any(mutate(c, rng).id != c.id for _ in range(10))
+
+
+def test_choice_bounds_alone_do_not_cap_size():
+    """The regression the cap exists for: bounding n_conv_layers/base_channels from above
+    does NOT bound params. Size is dominated by the dense bottleneck over the flattened
+    encoder output, which shrinks 4x per conv layer — so the *shallowest* member of the
+    space is the biggest, at ~10.7M. If this ever fails because the space itself got
+    smaller, the enforced cap below is what still guarantees the ceiling."""
+    biggest = Candidate(
+        n_conv_layers=3, base_channels=48, channel_mult=2.0, kernel_size=5, latent_dim=32
+    )
+    assert estimate_params(biggest) > 10_000_000
+    deeper = replace(biggest, n_conv_layers=4)
+    assert estimate_params(deeper) < estimate_params(biggest)  # more layers = smaller
+
+
+def test_operators_respect_max_params():
+    """Every operator must reject oversized proposals — otherwise a candidate costs a full
+    training budget to discover it is too big to converge under that budget."""
+    rng = np.random.RandomState(0)
+    randoms = [random_candidate(rng) for _ in range(400)]
+    assert all(estimate_params(c) <= MAX_PARAMS for c in randoms)
+    assert all(estimate_params(mutate(c, rng, n_edits=2)) <= MAX_PARAMS for c in randoms)
+    assert all(
+        estimate_params(crossover(randoms[i], randoms[i + 1], rng)) <= MAX_PARAMS
+        for i in range(0, len(randoms) - 1, 2)
+    )
+
+
+def test_max_params_none_disables_the_cap():
+    rng = np.random.RandomState(0)
+    sizes = [estimate_params(random_candidate(rng, max_params=None)) for _ in range(400)]
+    assert max(sizes) > MAX_PARAMS  # the oversized region is reachable again when opted out
+
+
+def test_cap_leaves_the_space_explorable():
+    """Rejection sampling reshapes the knob marginals — a value whose combinations are
+    mostly oversized gets drawn less often (base_channels=48 falls ~0.25 -> ~0.15). That is
+    intended, but it must not go so far that a knob becomes a blind spot: search_ledger_v2
+    showed what an unsampled region costs (norm=none drew twice, both times alongside the
+    residual crash, leaving zero surviving data and no way back via evolution)."""
+    rng = np.random.RandomState(0)
+    cands = [random_candidate(rng) for _ in range(4000)]
+    for knob in CHOICES:
+        counts = Counter(getattr(c, knob) for c in cands)
+        for value in CHOICES[knob]:
+            p = counts[value] / len(cands)
+            floor = 0.5 / len(CHOICES[knob])  # at least half of its uniform share
+            assert p >= floor, f"cap starves {knob}={value}: p={p:.3f} < {floor:.3f}"
+
+
+def test_impossible_cap_raises_rather_than_hanging():
+    rng = np.random.RandomState(0)
+    with np.testing.assert_raises(ValueError):
+        random_candidate(rng, max_params=1000)
 
 
 def test_ledger_append_frontier(tmp_path):
