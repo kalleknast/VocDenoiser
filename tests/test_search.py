@@ -95,6 +95,44 @@ def test_cap_leaves_the_space_explorable():
             assert p >= floor, f"cap starves {knob}={value}: p={p:.3f} < {floor:.3f}"
 
 
+def _ledger_with(tmp_path, rows):
+    ledger = Ledger(tmp_path / "l.jsonl")
+    for cand, metric, status in rows:
+        ledger.append(Record(id=cand.id, candidate=cand.to_dict(), metric=metric,
+                             num_params=1234, status=status))
+    return ledger
+
+
+def test_candidate_from_ledger_roundtrips_the_full_architecture(tmp_path):
+    """`train --from-ledger` is the only bridge from a search result to a trained model: the
+    harness throws the weights away and only 5 of 16 knobs survive to_config_overrides()."""
+    from vocdenoiser.denoise.train import candidate_from_ledger
+
+    want = Candidate(n_conv_layers=4, base_channels=32, norm="group", act="gelu",
+                     latent_dim=32, residual=True, recon_loss="l1", optimizer="adamw")
+    ledger = _ledger_with(tmp_path, [(Candidate(base_channels=16), -5.0, "keep"),
+                                     (want, -2.0, "keep")])
+    got, rec = candidate_from_ledger(str(ledger.path), want.id)
+    assert got == want  # every knob, not just the Config-expressible ones
+    assert rec.metric == -2.0
+    assert candidate_from_ledger(str(ledger.path), "best")[0] == want  # best = the incumbent
+
+
+def test_candidate_from_ledger_rejects_bad_ids_and_crashes(tmp_path):
+    import pytest
+
+    from vocdenoiser.denoise.train import candidate_from_ledger
+
+    crashed = Candidate(base_channels=24, residual=True)
+    ledger = _ledger_with(tmp_path, [(Candidate(base_channels=16), -5.0, "keep"),
+                                     (crashed, float("-inf"), "crash")])
+    with pytest.raises(SystemExit, match="not in"):
+        candidate_from_ledger(str(ledger.path), "nonexistent")
+    # a crashed candidate never trained -- training it would be a silent waste of GPU
+    with pytest.raises(SystemExit, match="CRASH"):
+        candidate_from_ledger(str(ledger.path), crashed.id)
+
+
 def test_impossible_cap_raises_rather_than_hanging():
     rng = np.random.RandomState(0)
     with np.testing.assert_raises(ValueError):

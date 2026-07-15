@@ -4,9 +4,10 @@ Status as of 2026-07-15, against `search_ledger_v2.jsonl` (25 records, ~26 h GPU
 3 seeds). Written as a handoff: the search is finished, and the next move needs labelled data
 (call type + caller identity) that is being collected.
 
-**TL;DR** — Stop the search; more `--iters` cannot help, for a measurable reason. Two candidates are
-worth carrying forward. But **you cannot train either of them today** — that gap (§3) is the first
-thing to fix, and it can be fixed before the data lands.
+**TL;DR** — Stop the search; more `--iters` cannot help, for a measurable reason (§1). Two candidates
+are worth carrying forward (§2). Training a search winner **used to be impossible** and is now a
+one-liner (§3), so when the labelled data lands the path is: train the shortlist → rank by identity
+retention → pick (§4).
 
 
 ## 1. The search is done: it plateaued at the metric's noise floor
@@ -65,10 +66,30 @@ Note both want **`latent_dim=32`**, not the SPECS default of 16 — but the sear
 identity retention, so treat that as a hypothesis for the identity eval to confirm, not a decision.
 
 
-## 3. BLOCKER: a search winner cannot currently be trained
+## 3. Training a search winner — RESOLVED (was a blocker)
 
-**This is the first thing to fix, and it does not need the labelled data.** The search's output is
-currently unrealisable. Four independent reasons:
+**Fixed; nothing here is outstanding.** Recorded because the failure was silent and the reasoning
+still matters. Train a ledger candidate with:
+
+```
+python -m vocdenoiser.denoise.train \
+    --from-ledger "$VOCDENOISER_OUTPUT_ROOT/artifacts/search_ledger_v2.jsonl" \
+    --candidate-id a60f295172 \
+    --data-root /content/clean_subset --noise-dirs /content/Noise /content/Cigarra
+```
+
+`--candidate-id best` takes the ledger's current incumbent (= best at *reconstruction*; see §4).
+Unknown ids list the best available; a `crash` record is refused rather than silently trained.
+Checkpoints land in their **own per-candidate subdir** (`checkpoints/search-<id>/`) with their own
+`last.ckpt`, so training several candidates back to back cannot mix runs. `eval.py --ckpt` then works
+unchanged — it detects a candidate checkpoint and rebuilds the right model automatically.
+
+Verified end-to-end: `a60f295172` trains from the real ledger and reloads through `eval`'s loader
+with **every one of the 16 knobs intact**, while the hand-model path is unchanged.
+
+### Why it was broken (keep in mind if this area is touched again)
+
+The search's output was unrealisable, for four independent reasons:
 
 1. **The harness never saves weights.** `search/harness.py` sets `enable_checkpointing=False`, so no
    candidate checkpoint exists — only ledger rows. Every candidate is trained for 3000 steps and
@@ -96,26 +117,29 @@ The 11 lost knobs split by difficulty:
 - **(B) Real work — not in `Config`, hardcoded in `BetaVAE`**:
   `n_conv_layers`, `channel_mult`, `kernel_size`, `norm`, `act`, `residual`, `dropout`.
 
-**Recommended fix:** don't widen `Config`/`BetaVAE` to absorb (B) — that duplicates
-`ConfigurableBetaVAE`, which already implements every knob and is exactly what the ledger scored.
-Instead make a ledger candidate trainable and loadable end-to-end:
+**How it was fixed** (`Config`/`BetaVAE` were deliberately NOT widened to absorb (B) — that would
+duplicate `ConfigurableBetaVAE`, which already implements every knob and is exactly what the ledger
+scored):
 
-1. **Make the checkpoint self-describing.** `model_factory.py:65` currently calls
-   `save_hyperparameters(ignore=["cand", "cfg"])`, so the candidate is **not** stored in the ckpt and
-   the file cannot say what architecture it is. Stop ignoring `cand` (store `cand.to_dict()`), and
-   `ConfigurableBetaVAE.load_from_checkpoint(path)` reconstructs itself with no external state.
-2. **`train --from-ledger <path> --candidate-id <id>`** — load the row, rebuild via
-   `build_search_model(cand, cfg)`, train with full checkpointing. The trained model is then what was
-   searched, by construction, with no new architecture code.
-3. **Teach `eval` to load it** — pick the class from the ckpt's hparams (once (1) lands, a candidate
-   ckpt is self-identifying) instead of assuming `BetaVAE`.
+1. **The checkpoint is now self-describing.** `ConfigurableBetaVAE` stores `cand` in
+   `hyper_parameters` as a plain dict (so unpickling never depends on the `Candidate` class); it
+   previously called `save_hyperparameters(ignore=["cand", "cfg"])`, so a trained candidate recorded
+   nothing about its own architecture. `load_from_checkpoint(path, cfg=...)` now rebuilds it with no
+   external state. `cfg` stays out (mirroring `BetaVAE`): it is the frozen geometry/data context,
+   supplied at load time, not a property of the weights.
+2. **`train --from-ledger/--candidate-id`** looks the row up and builds via
+   `build_search_model(cand, cfg)`. The candidate's `to_config_overrides()` is applied to `Config`,
+   so its **`batch_size` drives the dataloaders** — the same way the search harness builds `Config`,
+   which is what makes training match scoring.
+3. **`eval.load_model()`** dispatches on the ckpt's hparams instead of assuming `BetaVAE`.
 
 > **Do not verify this with a parameter count.** `BetaVAE(cfg)` and the winner's
 > `ConfigurableBetaVAE` both come to **exactly 4,557,953** params while having incompatible
 > state_dicts — GroupNorm and BatchNorm2d each carry `2·C` affine params, and activations are
 > parameter-free, so the counts coincide while the modules differ. A `num_params` assertion passes on
-> the wrong model. **Compare `state_dict()` keys** against a model freshly built from the ledger row.
-> (`space.estimate_params()` is still the right cross-check for *size*, which is all it claims.)
+> the wrong model. **Compare `state_dict()` keys** — `test_hand_and_candidate_state_dicts_are_incompatible`
+> pins exactly this. (`space.estimate_params()` is still the right cross-check for *size*, which is
+> all it claims.)
 
 
 ## 4. When the labelled data lands
@@ -127,30 +151,42 @@ ledger").
 
 Order of operations:
 
-1. **Fix §3 first** — otherwise there is nothing to evaluate. Do it before the data arrives.
-2. **Train the shortlist properly.** `e7f14ffdd0` and `a60f295172` (and `2d4003afe1` if cheap), full
-   training with checkpointing — *not* the 3000-step search budget. Use `--resume-from` /
-   `FRESH_START` per the notebook; keep `checkpoints/` unpolluted (each run in its own dir — mixing
-   runs has bitten this project before).
-3. **Run the identity eval on each**, with the new id→identity CSV:
+1. **Train the shortlist properly** — §3 is done, so this is now a one-liner per candidate. Train
+   `e7f14ffdd0` and `a60f295172` (and `2d4003afe1` if cheap) to convergence — *not* the 3000-step
+   search budget:
 
    ```
-   python -m vocdenoiser.denoise.eval --ckpt <ckpt> \
-       --labels-csv <identity.csv> --labels-key-col id --labels-value-col identity \
-       --out-png umap_<candidate-id>.png --out-latents latents_<candidate-id>.npy
+   python -m vocdenoiser.denoise.train \
+       --from-ledger "$VOCDENOISER_OUTPUT_ROOT/artifacts/search_ledger_v2.jsonl" \
+       --candidate-id e7f14ffdd0 \
+       --data-root /content/clean_subset --noise-dirs /content/Noise /content/Cigarra
    ```
+
+   Each candidate gets its own `checkpoints/search-<id>/` with its own `last.ckpt`, so
+   `--resume-from auto` resumes the right run and the candidates cannot pollute each other.
+2. **Run the identity eval on each**, with the new id→identity CSV. `--ckpt` needs no extra flags —
+   a candidate checkpoint identifies itself:
+
+   ```
+   python -m vocdenoiser.denoise.eval --ckpt checkpoints/search-<id>/search-<id>-epoch=NN-val_loss=X.ckpt \
+       --labels-csv <identity.csv> --labels-key-col id --labels-value-col identity \
+       --out-png umap_<id>.png --out-latents latents_<id>.npy
+   ```
+
+   (Quote paths containing `=`. `eval` prints which candidate it loaded — check it is the one you
+   meant.)
 
    `eval.py` flags: `--label-from {parent,stem,prefix}` / `--label-sep` if identity is encoded in the
    path rather than a CSV. Note `data/Vocalizations` filenames carry **no** identity — the CSV is
    required.
-4. **Rank by identity accuracy, not SI-SDR.** The existing cross-dataset reference point is
+3. **Rank by identity accuracy, not SI-SDR.** The existing cross-dataset reference point is
    **0.680 ± 0.005** (β-VAE, 16-dim latents, RF proxy, cv=5) on InfantMarmosetsVox vs a 0.178
    majority-class floor. That is a *different* dataset/latent-dim, so it is a sanity anchor, not a
    baseline to beat directly.
-5. **Then decide `latent_dim`.** The whole top cluster chose 32 on reconstruction grounds. Whether 32
+4. **Then decide `latent_dim`.** The whole top cluster chose 32 on reconstruction grounds. Whether 32
    beats 16 on identity retention is exactly the open question — and a compression argument favours
    16 if identity holds. Test both on the winning architecture.
-6. **Call-type labels** additionally allow re-running the call-agnosticism check
+5. **Call-type labels** additionally allow re-running the call-agnosticism check
    (`snr validate-types`) on the *denoised* output, and confirm the denoiser is not quietly
    specialising on phees at the expense of other call types.
 

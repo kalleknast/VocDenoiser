@@ -131,6 +131,72 @@ def test_estimate_params_matches_factory():
                     )
 
 
+def test_search_candidate_ckpt_is_self_describing(tmp_path):
+    """A trained search winner must be reloadable from its ckpt ALONE. The harness never
+    checkpoints, `train` built the hand BetaVAE, and `eval` hardcoded BetaVAE.load_from_
+    checkpoint — so the searched architecture (16 knobs, only 5 expressible as Config flags)
+    was unrecoverable. Storing `cand` in hyper_parameters is what closes that."""
+    import lightning as L
+
+    from vocdenoiser.denoise.eval import load_model
+    from vocdenoiser.search.model_factory import ConfigurableBetaVAE, build_search_model
+    from vocdenoiser.search.space import Candidate
+
+    cfg = _tiny_cfg(base_channels=16, latent_dim=8)
+    cand = Candidate(
+        n_conv_layers=4, base_channels=16, channel_mult=2.0, kernel_size=4, norm="group",
+        act="gelu", latent_dim=8, residual=True, dropout=0.1, beta=3.0,
+        beta_schedule="warmup", recon_loss="l1", optimizer="adamw", lr=1.6e-4,
+    )
+    model = build_search_model(cand, cfg)
+    path = str(tmp_path / "cand.ckpt")
+    trainer = L.Trainer(logger=False, enable_checkpointing=False, accelerator="cpu", devices=1)
+    trainer.strategy.connect(model)
+    trainer.save_checkpoint(path)
+
+    # Reloadable with no knowledge of the candidate beyond the file itself.
+    back = ConfigurableBetaVAE.load_from_checkpoint(path, cfg=cfg)
+    assert back.cand == cand
+    assert set(back.state_dict()) == set(model.state_dict())
+
+    # eval dispatches on the ckpt, not on an assumption about which model wrote it.
+    assert isinstance(load_model(path, cfg), ConfigurableBetaVAE)
+
+
+def test_eval_still_loads_a_hand_betavae_ckpt(tmp_path):
+    """The dispatch must not regress the hand model: a BetaVAE ckpt has no `cand` hparam."""
+    import lightning as L
+
+    from vocdenoiser.denoise.eval import load_model
+
+    cfg = _tiny_cfg()
+    model = BetaVAE(cfg)
+    path = str(tmp_path / "hand.ckpt")
+    trainer = L.Trainer(logger=False, enable_checkpointing=False, accelerator="cpu", devices=1)
+    trainer.strategy.connect(model)
+    trainer.save_checkpoint(path)
+    assert isinstance(load_model(path, cfg), BetaVAE)
+
+
+def test_hand_and_candidate_state_dicts_are_incompatible():
+    """Why load_model dispatches on hparams and NOT on a parameter count: for the ledger's
+    winning candidate the two models have IDENTICAL param counts and incompatible weights, so
+    a num_params check would happily load the wrong architecture."""
+    from vocdenoiser.search.model_factory import build_search_model
+    from vocdenoiser.search.space import Candidate
+
+    cand = Candidate(
+        n_conv_layers=4, base_channels=32, channel_mult=2.0, kernel_size=4, norm="group",
+        act="gelu", latent_dim=32, residual=False,
+    )
+    cfg = _tiny_cfg(base_channels=32, latent_dim=32)
+    searched, hand = build_search_model(cand, cfg), BetaVAE(cfg)
+    assert sum(p.numel() for p in searched.parameters()) == sum(
+        p.numel() for p in hand.parameters()
+    ), "premise of this test: the counts coincide (GroupNorm/BatchNorm both carry 2*C)"
+    assert set(searched.state_dict()) != set(hand.state_dict())
+
+
 def test_diverged_candidate_aborts_instead_of_burning_its_budget():
     """A candidate that NaNs used to skip every remaining step and still be scored -inf at
     the end — 4 such candidates burned 2.7h of a 16.8h run in search_ledger_v2. Once the

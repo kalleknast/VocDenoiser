@@ -14,17 +14,18 @@ Copy the clean set to local disk first — do not train off the pCloud mount.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 from vocdenoiser.denoise.config import Config
 
 
-def _best_ckpt(ckpt_dir: Path) -> Path | None:
+def _best_ckpt(ckpt_dir: Path, stem: str = "betavae") -> Path | None:
     """Lowest-val_loss finite checkpoint in ``ckpt_dir`` (skips NaN-named files)."""
     import re
 
     cands = [
-        p for p in ckpt_dir.glob("betavae-*val_loss=*.ckpt") if "nan" not in p.name.lower()
+        p for p in ckpt_dir.glob(f"{stem}-*val_loss=*.ckpt") if "nan" not in p.name.lower()
     ]
     if not cands:
         return None
@@ -33,7 +34,7 @@ def _best_ckpt(ckpt_dir: Path) -> Path | None:
     )
 
 
-def _resolve_resume(resume_from: str | None, cfg: Config) -> str | None:
+def _resolve_resume(resume_from: str | None, cfg: Config, stem: str = "betavae") -> str | None:
     """Map ``--resume-from`` to a ``trainer.fit(ckpt_path=...)`` value (None = fresh)."""
     if not resume_from:
         return None
@@ -46,7 +47,7 @@ def _resolve_resume(resume_from: str | None, cfg: Config) -> str | None:
         print(f"--resume-from {resume_from}: no last.ckpt in {ckpt_dir} — starting fresh.")
         return None
     if resume_from == "best":
-        best = _best_ckpt(ckpt_dir)
+        best = _best_ckpt(ckpt_dir, stem)
         if best is not None:
             print(f"Resuming from best checkpoint {best}")
             return str(best)
@@ -54,6 +55,49 @@ def _resolve_resume(resume_from: str | None, cfg: Config) -> str | None:
         return None
     print(f"Resuming from {resume_from}")
     return resume_from
+
+
+def candidate_from_ledger(ledger_path: str, candidate_id: str):
+    """Look up one search candidate by id (or ``"best"``) in a search ledger.
+
+    The bridge from a search result to a trainable model: the ledger is the ONLY record of
+    what the search scored — the harness trains each candidate for a fixed budget with
+    checkpointing off and throws the weights away.
+    """
+    from vocdenoiser.search.ledger import Ledger
+    from vocdenoiser.search.space import Candidate
+
+    ledger = Ledger(ledger_path)
+    records = ledger.load()
+    if not records:
+        raise SystemExit(f"--from-ledger {ledger_path}: no records found")
+
+    if candidate_id == "best":
+        rec = ledger.best()
+        if rec is None:
+            raise SystemExit(f"--from-ledger {ledger_path}: no kept candidate to take as 'best'")
+    else:
+        rec = next((r for r in records if r.id == candidate_id), None)
+        if rec is None:
+            top = ", ".join(
+                f"{r.id} ({r.metric:+.4f})"
+                for r in sorted((x for x in records if x.status != "crash"),
+                                key=lambda x: -x.metric)[:5]
+            )
+            raise SystemExit(
+                f"--candidate-id {candidate_id!r} not in {ledger_path}.\n"
+                f"Best available: {top}\nOr pass --candidate-id best."
+            )
+    if rec.status == "crash":
+        raise SystemExit(
+            f"candidate {rec.id} is recorded as a CRASH (metric -inf) — it never trained. "
+            f"Pick another id."
+        )
+    print(
+        f"Candidate {rec.id} from {ledger_path}: search metric {rec.metric:+.4f}"
+        f"±{rec.metric_std:.3f}, {rec.num_params:,} params ({rec.status}, origin={rec.origin})"
+    )
+    return Candidate.from_dict(rec.candidate), rec
 
 
 def build_dataloaders(cfg: Config):
@@ -89,6 +133,7 @@ def main(argv: list[str] | None = None) -> None:
     from lightning.pytorch.callbacks import Callback, EarlyStopping, ModelCheckpoint
 
     from vocdenoiser.denoise.beta_vae import BetaVAE
+    from vocdenoiser.search.model_factory import build_search_model
 
     # TF32 matmuls on Tensor-Core GPUs (L4/A100): a throughput win at negligible
     # precision cost for this task; harmless no-op on CPU/other GPUs.
@@ -103,11 +148,45 @@ def main(argv: list[str] | None = None) -> None:
         "'best' (lowest-val_loss ckpt), or an explicit .ckpt path. Checkpoints live "
         "under --output-root / $VOCDENOISER_OUTPUT_ROOT, so this resumes across resets.",
     )
+    parser.add_argument(
+        "--from-ledger",
+        default=None,
+        help="train an architecture-search WINNER instead of the hand-designed BetaVAE: "
+        "path to a search ledger JSONL (pair with --candidate-id). The searched "
+        "architecture (norm/act/depth/residual/... ) cannot be expressed as Config flags, "
+        "so this is the only way to train what the search actually scored.",
+    )
+    parser.add_argument(
+        "--candidate-id",
+        default=None,
+        help="which candidate from --from-ledger to train; 'best' takes the ledger's "
+        "current incumbent. Note the search metric is reconstruction SI-SDR only — it is "
+        "blind to caller-identity retention, so 'best' is best-at-reconstruction.",
+    )
     args = parser.parse_args(argv)
     cfg = Config.from_args(args)
 
+    # A ledger candidate supersedes the model/optimisation flags: its architecture is what the
+    # search scored, and its batch_size must drive the dataloaders (the search harness builds
+    # Config the same way, so training matches scoring). Geometry/data flags stay from the CLI.
+    # Checkpoints go to their own per-candidate subdir: several candidates get trained back to
+    # back, they each write a `last.ckpt`, and mixing runs in one dir has bitten this project
+    # before (a stale NaN `last.ckpt` poisoning a later eval).
+    cand = None
+    stem = "betavae"
+    if args.from_ledger or args.candidate_id:
+        if not (args.from_ledger and args.candidate_id):
+            parser.error("--from-ledger and --candidate-id must be given together")
+        cand, _rec = candidate_from_ledger(args.from_ledger, args.candidate_id)
+        stem = f"search-{cand.id}"
+        cfg = replace(
+            cfg,
+            **cand.to_config_overrides(),
+            ckpt_dir=str(Path(cfg.ckpt_dir) / stem),
+        )
+
     train_ds, train_dl, val_dl = build_dataloaders(cfg)
-    model = BetaVAE(cfg)
+    model = build_search_model(cand, cfg) if cand is not None else BetaVAE(cfg)
 
     class _SetEpoch(Callback):
         def on_train_epoch_start(self, trainer, _pl_module):
@@ -115,7 +194,7 @@ def main(argv: list[str] | None = None) -> None:
 
     ckpt = ModelCheckpoint(
         dirpath=str(cfg.resolved_ckpt_dir()),
-        filename="betavae-{epoch:02d}-{val_loss:.4f}",
+        filename=stem + "-{epoch:02d}-{val_loss:.4f}",
         monitor="val_loss",
         mode="min",
         save_top_k=3,
@@ -157,7 +236,7 @@ def main(argv: list[str] | None = None) -> None:
         log_every_n_steps=10,
         gradient_clip_val=1.0,  # cap step size so a bad batch can't blow the VAE up to NaN
     )
-    trainer.fit(model, train_dl, val_dl, ckpt_path=_resolve_resume(args.resume_from, cfg))
+    trainer.fit(model, train_dl, val_dl, ckpt_path=_resolve_resume(args.resume_from, cfg, stem))
     print(f"Best checkpoint: {ckpt.best_model_path}")
 
 

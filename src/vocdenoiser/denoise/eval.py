@@ -78,12 +78,42 @@ def _resolve_labels(files: list[Path], args) -> list[str | None]:
     return [_label_for(p, args.label_from, args.label_sep) for p in files]
 
 
+def load_model(ckpt_path: str, eval_cfg: Config):
+    """Load a checkpoint as whichever model wrote it.
+
+    Two model families produce checkpoints here and their ``state_dict``s are NOT compatible:
+    the hand-designed :class:`BetaVAE` and the search's ``ConfigurableBetaVAE`` (different norm
+    modules, depth, kernels, ...). A search-candidate checkpoint carries its ``cand`` in
+    ``hyper_parameters`` (see model_factory), so it identifies itself — dispatch on that rather
+    than assuming BetaVAE, which would fail to load a trained search winner.
+
+    Do NOT try to tell them apart by parameter count: BetaVAE and the ledger's winning
+    candidate both come to exactly 4,557,953 params with incompatible state_dicts (GroupNorm and
+    BatchNorm2d each carry 2*C affine params, activations are parameter-free).
+    """
+    import torch
+
+    from vocdenoiser.denoise.beta_vae import BetaVAE
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if "cand" in (ckpt.get("hyper_parameters") or {}):
+        from vocdenoiser.search.model_factory import ConfigurableBetaVAE
+
+        model = ConfigurableBetaVAE.load_from_checkpoint(ckpt_path, cfg=eval_cfg)
+        print(
+            f"Loaded search candidate {model.cand.id} "
+            f"(latent_dim={model.cand.latent_dim}, norm={model.cand.norm}, act={model.cand.act}, "
+            f"residual={model.cand.residual}) from {ckpt_path}"
+        )
+        return model
+    return BetaVAE.load_from_checkpoint(ckpt_path, cfg=eval_cfg)
+
+
 def extract_latents(cfg: Config, ckpt_path: str) -> tuple[np.ndarray, list[Path]]:
-    """Encode every clean call to its 16-dim latent mean ``mu``."""
+    """Encode every clean call to its latent mean ``mu`` (dim = the model's latent_dim)."""
     import torch
     from torch.utils.data import DataLoader
 
-    from vocdenoiser.denoise.beta_vae import BetaVAE
     from vocdenoiser.denoise.dataset import PheeDenoiseDataset, list_clean_calls
 
     eval_cfg = Config(**{**cfg.__dict__, "augment": False})
@@ -91,7 +121,7 @@ def extract_latents(cfg: Config, ckpt_path: str) -> tuple[np.ndarray, list[Path]
     ds = PheeDenoiseDataset(eval_cfg, files)
     dl = DataLoader(ds, batch_size=eval_cfg.batch_size, num_workers=eval_cfg.num_workers)
 
-    model = BetaVAE.load_from_checkpoint(ckpt_path, cfg=eval_cfg)
+    model = load_model(ckpt_path, eval_cfg)
     model.eval()
     device = model.device
 

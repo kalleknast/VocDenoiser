@@ -55,14 +55,26 @@ class ConfigurableBetaVAE(L.LightningModule):
     """A β-VAE whose depth/width/kernel/norm/act/residual come from a Candidate."""
 
     def __init__(
-        self, cand: Candidate, cfg: Config, nonfinite_patience: int = NONFINITE_PATIENCE
+        self, cand: Candidate | dict, cfg: Config, nonfinite_patience: int = NONFINITE_PATIENCE
     ) -> None:
         super().__init__()
+        # ``load_from_checkpoint`` replays __init__ with the saved hyperparameters, where the
+        # candidate is a plain dict — accept either form.
+        if isinstance(cand, dict):
+            cand = Candidate.from_dict(cand)
         self.cand = cand
         self.cfg = cfg
         self.nonfinite_patience = nonfinite_patience
         self._nonfinite_streak = 0
-        self.save_hyperparameters(ignore=["cand", "cfg"])
+        # Store the candidate IN the checkpoint (as a dict, so unpickling never depends on the
+        # Candidate class) — this is what makes the file self-describing: the architecture is
+        # recoverable from the ckpt alone, without the ledger that proposed it. Without this a
+        # trained candidate is unloadable, since nothing else records which of the 16 knobs it
+        # used. ``cfg`` stays out (mirroring BetaVAE): it is the frozen geometry/data context,
+        # supplied at load time, not a property of the trained weights.
+        self.save_hyperparameters(
+            {"cand": cand.to_dict(), "nonfinite_patience": nonfinite_patience}
+        )
 
         n = cand.n_conv_layers
         ds = 2**n
